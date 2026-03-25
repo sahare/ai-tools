@@ -25,13 +25,22 @@ Instead of reading docs and running commands manually, just tell your AI assista
 ## Getting Started
 
 1. Clone this repo
-2. Open it in Cursor (or any AI-enabled IDE)
-3. The `.cursorrules` file teaches your AI assistant the available skills
+2. Open it in any AI-enabled IDE or tool
+3. The AI agent instructions are picked up automatically:
+
+| AI Tool | Config File | Auto-loaded? |
+|---------|-------------|--------------|
+| Cursor | `.cursorrules` → `AGENT.md` | ✅ Yes |
+| Claude Code | `CLAUDE.md` → `AGENT.md` | ✅ Yes |
+| GitHub Copilot | `AGENT.md` | ✅ Yes |
+| Windsurf / Cody / Other | `AGENT.md` | Read manually or reference it |
+| ChatGPT / Claude web | N/A | Paste `diagnose.sh` output for analysis |
+
 4. Start asking your AI assistant to do things
 
 ## AI Agent Skills
 
-The `.cursorrules` file defines these skills:
+[`AGENT.md`](AGENT.md) defines these skills (works with any AI agent):
 
 | Skill | Trigger | What It Does |
 |-------|---------|--------------|
