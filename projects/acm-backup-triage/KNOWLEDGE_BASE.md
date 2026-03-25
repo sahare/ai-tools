@@ -161,25 +161,51 @@ spec:
 **Override:** MCH annotation `mch-imageOverridesCM` can override OADP channel if needed.
 **Redirect to:** OADP team for OADP-specific bugs
 
-### 10. "Primary hub still running, want to move clusters to new hub"
+### 10. "Moving managed clusters between two non-identical hubs"
+**Category:** Architecture guidance — COMMON QUESTION
+**Key insight:** If customer has two independent ACM hubs each managing their own clusters and wants DR between them, this is a **"move managed clusters"** scenario, NOT a standard active/passive restore.
+
+**Why full restore is wrong:**
+- The two hubs are NOT identical — different apps, policies, resources
+- Full restore would overwrite existing resources on hub2 or create new ones
+- `cleanupBeforeRestore: CleanupAll` would remove hub2's own managed clusters
+- Even `CleanupRestored` is risky if a prior restore was done (hub2's clusters could get tagged)
+- Policies/placements from hub1 could unexpectedly apply to hub2's clusters
+
+**Correct approach:** Use the "move managed clusters" procedure:
+- Blog: https://developers.redhat.com/learn/openshift/move-managed-clusters-using-acm-212-backup-component
+- Only move the managed cluster activation data, not all hub content
+- Both hubs MUST have identical policies/apps for any placement that could match moved clusters
+
+**Uncontrolled failover (hub1 dies without preparation):**
+- ACM 2.14+ has `ImportOnly` import strategy (set by default on new installs)
+- `ImportOnly` prevents the hub from re-importing clusters it already knows about, avoiding flip-flop
+- If upgrading from older ACM, verify `ImportOnly` is set
+- For ACM < 2.14, there is no workaround for uncontrolled DR
+
+**Strong recommendation:** Full active/passive with identical hubs is the supported, well-tested path. If two independent hubs must exist (e.g., network/latency constraints), treat them as separate ACM domains.
+
+**Cleanup is optional:** After moving clusters, cleaning up on the source hub is a choice, not a requirement. The doc says "you can choose to clean up" — don't advise customers they MUST do it.
+
+### 11. "Primary hub still running, want to move clusters to new hub"
 **Category:** Informational / procedure
 **This is NOT a disaster scenario.** Both hubs are running.
 **Steps:**
   1. On primary: ensure BackupSchedule is Enabled, latest backup is recent
-  2. On primary: pause or delete BackupSchedule
-  3. On new hub: create Restore with `cleanupBeforeRestore: CleanupAll` (first time) or `CleanupRestored`
-  4. Set `veleroManagedClustersBackupName: latest` to activate clusters on new hub
-  5. Primary hub should NOT have active BackupSchedule while new hub activates
+  2. On primary: prepare the hub (follow "Prepare the primary hub" steps)
+  3. On new hub: create Restore to move managed clusters
+  4. Cleanup on primary is optional
+**Note:** If using ACM 2.14+, the `ImportOnly` strategy eliminates the need for the prepare step in uncontrolled scenarios.
 **Blog:** https://developers.redhat.com/learn/openshift/move-managed-clusters-using-acm-212-backup-component
 **Docs:** https://docs.redhat.com/en/documentation/red_hat_advanced_cluster_management_for_kubernetes/2.16/html/business_continuity/index#restore-primary-active
 
-### 11. "Application data backup on managed clusters"
+### 12. "Application data backup on managed clusters"
 **Category:** Out of scope (informational)
 **This operator does NOT backup application data on managed clusters.** It only backs up hub cluster configuration.
 For application data DR, use OADP/Velero policies deployed via ACM policies to managed clusters.
 **Blog:** https://www.redhat.com/en/blog/back-up-and-restore-application-persistent-data-with-red-hat-advanced-cluster-management-for-kubernetes-policies
 
-### 12. "Restore validation webhook rejection"
+### 13. "Restore validation webhook rejection"
 **Category:** Expected behavior
 **When `syncRestoreWithNewBackups: true`, the webhook enforces:**
   - All three backup names must be set
