@@ -109,6 +109,28 @@ It is compatible with any AI agent that can read project files and execute shell
 
 4. Remind the user to run `make update` in the release repo and create a PR.
 
+### Skill: Triage Customer Backup/Restore Issue
+
+**Triggers:** "triage this", "customer issue", "customer says", "help with this support question"
+
+**Steps:**
+1. Read the customer's message/description
+2. Refer to `projects/acm-backup-triage/KNOWLEDGE_BASE.md` for known issues, phases, and ownership
+3. Categorize the issue:
+   - **Config/setup mistake** → provide correct configuration and doc links
+   - **Known limitation** → explain the behavior, provide workaround
+   - **OADP/Velero issue** → redirect to OADP team with context
+   - **Potential bug** → list what info to collect from the customer
+   - **Informational** → answer the question with doc links
+4. Draft a response for the team member to review before posting
+5. Always include relevant doc/blog links from the knowledge base
+
+**Important:**
+- Always check the knowledge base first before searching code
+- If unsure, recommend collecting more info rather than guessing
+- Never share internal code details with customers — reference docs and expected behaviors
+- If it matches a known issue in the knowledge base, say so explicitly
+
 ## Behavior Guidelines
 
 - **Ask before destructive operations** — always confirm before uninstall or delete

@@ -19,6 +19,7 @@ Instead of reading docs and running commands manually, just tell your AI assista
 
 | Project | Description | Manual Effort Saved |
 |---------|-------------|---------------------|
+| [acm-backup-triage](projects/acm-backup-triage/) | AI-powered triage for customer backup/restore issues | ~15-30 min per triage |
 | [acm-cluster-setup](projects/acm-cluster-setup/) | Automated ACM dev build installation with AI-powered diagnostics | ~30 min per install |
 | [acm-release-cut](projects/acm-release-cut/) | Automated CI config changes for new ACM release branches | ~2 hours per release cut |
 
@@ -44,6 +45,7 @@ Instead of reading docs and running commands manually, just tell your AI assista
 
 | Skill | Trigger | What It Does |
 |-------|---------|--------------|
+| Triage Customer Issue | "triage this customer issue" | Categorizes issue, identifies root cause, drafts response |
 | Install ACM | "install ACM on my cluster" | Runs install script, monitors, verifies |
 | Uninstall ACM | "remove ACM from cluster" | Clean uninstall of all ACM components |
 | Diagnose Issues | "why is ACM failing?" | Collects cluster state, AI analyzes root cause |
