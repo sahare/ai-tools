@@ -131,6 +131,68 @@ It is compatible with any AI agent that can read project files and execute shell
 - Never share internal code details with customers — reference docs and expected behaviors
 - If it matches a known issue in the knowledge base, say so explicitly
 
+### Skill: Assess ACM Backup Configuration on a Cluster
+
+**Triggers:** "check backup config", "which hub is active", "assess backup status", "is this hub active or passive", "backup health"
+
+Use this when connected to a cluster (via `oc`) and you need to determine its backup/restore role and health.
+
+**Steps:**
+1. Determine the cluster's identity:
+   ```bash
+   oc get clusterversion version -o jsonpath='{.spec.clusterID}'
+   ```
+
+2. Check OADP and storage:
+   ```bash
+   oc get DataProtectionApplication -n open-cluster-management-backup
+   oc get backupstoragelocation -n open-cluster-management-backup
+   ```
+
+3. Check BackupSchedule and Restore:
+   ```bash
+   oc get backupschedule -n open-cluster-management-backup -o yaml
+   oc get restore.cluster.open-cluster-management.io -n open-cluster-management-backup -o yaml
+   ```
+
+4. Determine cluster role by checking backup ownership — compare the `backup-cluster` label on the latest heartbeat backup against this cluster's ID:
+   ```bash
+   oc get backups.velero.io -n open-cluster-management-backup \
+     -l velero.io/schedule-name=acm-validation-policy-schedule \
+     --sort-by=.status.startTimestamp \
+     -o custom-columns='NAME:.metadata.name,HUB:.metadata.labels.cluster\.open-cluster-management\.io/backup-cluster'
+   ```
+
+5. Check for failover history (managed-clusters restore):
+   ```bash
+   oc get backups.velero.io -n open-cluster-management-backup \
+     -o custom-columns='NAME:.metadata.name,RESTORE-HUB:.metadata.labels.cluster\.open-cluster-management\.io/restore-cluster' \
+     | grep -v '<none>'
+   ```
+
+6. Check governance policy compliance:
+   ```bash
+   oc get policy backup-restore-enabled -n open-cluster-management-backup -o yaml
+   ```
+
+**Interpret the role using this table:**
+
+| Condition | Role |
+|-----------|------|
+| Latest heartbeat's `backup-cluster` matches this cluster | **ACTIVE HUB** |
+| Has Restore with `ManagedClusters: skip` | **PASSIVE HUB** |
+| Passive + `syncRestoreWithNewBackups: true` | **PASSIVE HUB (sync)** |
+| BackupSchedule exists but another hub owns latest backups | **COLLIDING** — only one hub should write |
+| Restore with `ManagedClusters` != skip | **FAILOVER / ACTIVATION in progress** |
+| No BackupSchedule or Restore | **NOT CONFIGURED** |
+
+**Common issues to flag:**
+- This cluster ran failover but has no BackupSchedule → should create one
+- This cluster has a BackupSchedule but another hub owns latest backups → collision
+- Passive cluster but no backups in storage → active hub may not be running
+- Passive cluster but no heartbeat backups → active hub's cron may have stopped
+- `backup-restore-enabled` policy NonCompliant → check per-template violations
+
 ## Behavior Guidelines
 
 - **Ask before destructive operations** — always confirm before uninstall or delete

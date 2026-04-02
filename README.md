@@ -46,6 +46,7 @@ Instead of reading docs and running commands manually, just tell your AI assista
 | Skill | Trigger | What It Does |
 |-------|---------|--------------|
 | Triage Customer Issue | "triage this customer issue" | Categorizes issue, identifies root cause, drafts response |
+| Assess Backup Config | "which hub is active?" | Detects cluster role, backup ownership, policy compliance |
 | Install ACM | "install ACM on my cluster" | Runs install script, monitors, verifies |
 | Uninstall ACM | "remove ACM from cluster" | Clean uninstall of all ACM components |
 | Diagnose Issues | "why is ACM failing?" | Collects cluster state, AI analyzes root cause |
