@@ -1,23 +1,67 @@
-# ACM Backup & Restore - Triage Knowledge Base
+# ACM Backup & Restore - Knowledge Base
 
-This knowledge base is used by AI agents to triage customer issues related to the ACM cluster-backup-operator.
+## What is the Cluster Backup and Restore Operator?
 
-## Scope
+The cluster-backup-operator provides disaster recovery for Red Hat Advanced Cluster Management (ACM) hub clusters. It runs on the hub cluster and uses OADP/Velero to back up and restore hub configuration — managed clusters, policies, applications, credentials, and other hub resources.
 
-The cluster-backup-operator handles **hub cluster disaster recovery only**. It does NOT handle:
-- Application DR on managed clusters (use OADP/Velero policies instead)
+It does **NOT** handle:
+- Application DR on managed clusters (use OADP/Velero policies instead — see [issue #12](#12-application-data-backup-on-managed-clusters))
 - Managed cluster availability
-- Velero internals (that's OADP team)
+- Velero internals (that's the OADP team)
+
+**Getting started:** Enable `cluster-backup` on the `MultiClusterHub` resource. This installs both the backup operator and the OADP operator in the `open-cluster-management-backup` namespace. Then create a `DataProtectionApplication` to connect to your S3 storage, and create a `BackupSchedule` to start backing up.
+
+**GitHub:** https://github.com/stolostron/cluster-backup-operator
+**Official docs:** https://docs.redhat.com/en/documentation/red_hat_advanced_cluster_management_for_kubernetes/2.16/html/business_continuity/index
 
 ## Ownership Boundaries
 
 | Component | Team | Slack Channel |
 |-----------|------|---------------|
-| BackupSchedule / Restore CRs, backup selection, collision detection, sync mode, cleanup, auto-import | **cluster-backup-operator (us)** | Our channel |
+| BackupSchedule / Restore CRs, backup selection, collision detection, sync mode, cleanup, auto-import | **cluster-backup-operator** | #forum-acm-backupandrestore |
 | DataProtectionApplication, BackupStorageLocation, Velero pod, Velero backup/restore execution | **OADP team** | #forum-oadp |
 | MultiClusterHub, operator installation, cluster-backup chart deployment | **MCH/MCE team** | #forum-acm |
 | ManagedServiceAccount, addon framework | **MCE/Foundation team** | #forum-acm |
 | Managed cluster import/detach mechanics | **Foundation team** | #forum-acm |
+
+## How Backups Work
+
+The operator creates 5 Velero schedules when a `BackupSchedule` is created:
+
+| Velero Schedule | What it backs up |
+|-----------------|-----------------|
+| `acm-credentials-schedule` | Secrets and ConfigMaps with Hive/ACM backup labels |
+| `acm-resources-schedule` | ACM resources — policies, applications, placements |
+| `acm-resources-generic-schedule` | User-labeled resources (`cluster.open-cluster-management.io/backup`) |
+| `acm-managed-clusters-schedule` | Managed cluster activation data (ManagedCluster, ClusterDeployment, etc.) |
+| `acm-validation-policy-schedule` | Short-lived heartbeat backup for cron validation |
+
+Resources are backed up in two categories:
+- **Passive data** — credentials, resources, policies, apps. Restoring these does NOT activate managed clusters on the new hub.
+- **Activation data** — managed cluster resources. Restoring these makes managed clusters connect to the new hub.
+
+## What Gets Backed Up
+
+**Backed up by default (no label needed):**
+- Resources from API groups: `*.open-cluster-management.io`, `*.hive.openshift.io`, `argoproj.io`, `app.k8s.io`, `core.observatorium.io`
+- `agent-install.openshift.io` resources (in managed-clusters backup)
+- ManagedCluster, ClusterDeployment, MachinePool, KlusterletAddonConfig, ManagedClusterAddon, Policies (root only), Placements, PlacementRules, PlacementBindings
+- Secrets/ConfigMaps with labels: `cluster.open-cluster-management.io/type`, `hive.openshift.io/secret-type`, or `cluster.open-cluster-management.io/backup`
+
+**NOT backed up by default (needs label):**
+- Resources in excluded API groups: `internal`, `operator`, `work`, `search`, `admission.hive`, `proxy`, `action`, `view`, `clusterview`, `velero.io`
+- Excluded CRDs: `clustermanagementaddon`, `backupschedule`, `restore`, `clusterclaim.cluster`, `discoveredcluster`
+- User-created ConfigMaps/Secrets without backup labels
+- Resources in the MCH namespace (unless labeled)
+- AddonDeploymentConfig (excluded by default)
+- Child/propagated policies (only root policies are backed up)
+- `local-cluster` namespace resources
+
+**How to include custom resources:** Add label `cluster.open-cluster-management.io/backup: ""` (use value `cluster-activation` if the resource should only restore during managed cluster activation)
+
+**How to exclude a resource:** Add label `velero.io/exclude-from-backup: "true"`
+
+**Note:** Secrets used by Hive `ClusterDeployment` are auto-labeled when created via the console UI. If created via GitOps, the `cluster.open-cluster-management.io/backup` label must be added manually.
 
 ## BackupSchedule Phases
 
@@ -31,41 +75,81 @@ The cluster-backup-operator handles **hub cluster disaster recovery only**. It d
 | **Unknown** | Velero schedules not fully enabled | Velero pod not running, OADP misconfigured |
 | **Paused** | User paused the schedule | `spec.paused: true` |
 
+**Important behavior:** A non-paused BackupSchedule cannot coexist with an active Restore (any phase except Finished/FinishedWithErrors). A paused BackupSchedule can coexist with an active Restore. A completed Restore (Finished/FinishedWithErrors) does not block a BackupSchedule.
+
 ## Restore Phases
 
 | Phase | Meaning | Common Causes |
 |-------|---------|---------------|
 | **Started** | Cleanup or initial restore in progress | Normal early phase |
 | **Running** | Velero restores executing | Normal during restore |
-| **Finished** | All restores completed successfully | Healthy completion |
+| **Finished** | All restores completed successfully | Healthy completion, or activation completed |
 | **FinishedWithErrors** | Partial failures | Velero `PartiallyFailed`, concurrent Restore/BackupSchedule active, invalid cleanupBeforeRestore value |
 | **Error** | Hard failure | BSL unavailable, Velero restore `Failed`/`FailedValidation`, initialization error |
-| **Enabled** | Passive sync active | `syncRestoreWithNewBackups: true` with valid config, syncing periodically |
+| **Enabled** | Passive sync active | `syncRestoreWithNewBackups: true` with MC=skip and creds/resources=latest, syncing periodically |
 | **Unknown** | Velero restore status unclear | Velero pod issue |
+
+**Important behavior:**
+- Only one active Restore is allowed at a time. "Active" means any phase except Finished/FinishedWithErrors.
+- Patching `veleroManagedClustersBackupName` from `skip` to `latest` on an Enabled Restore triggers activation. The phase transitions from Enabled → Started → Running → Finished.
+- After activation completes (Finished), the sync stops — it does not return to Enabled.
+
+## Cleanup Options (`cleanupBeforeRestore`)
+
+| Value | Behavior |
+|-------|----------|
+| **None** | No cleanup. Use on a brand new hub or when restoring all resources for the first time. |
+| **CleanupRestored** | Removes resources that were created by a **previous ACM restore** and are not in the current backup. Identifies them by the `velero.io/backup-name` label. Safe for passive hubs. **Recommended for most cases.** |
+| **CleanupAll** | Removes **all** resources that could be part of an ACM backup, even if not created by a restore. **Use with extreme caution** — this deletes user-created resources too. |
+
+**CleanupRestored detail:** For secrets/configmaps, requires the `velero.io/backup-name` label to exist AND point to a different backup than the current one. For dynamic resources, uses label selectors matching the backup's included resource kinds. Resources with `velero.io/exclude-from-backup: true` are never cleaned up. Resources in the `local-cluster` namespace and MCH namespace are excluded from cleanup.
+
+## OADP Version Compatibility
+
+| ACM Version | OADP Version |
+|-------------|-------------|
+| 2.13+ | 1.4 or stable channel (stable for OCP 4.19+) |
+| 2.12 | 1.4 |
+| 2.11 | 1.4 |
+| 2.10.4 | 1.4 |
+| 2.10 | 1.3 |
+| 2.9.3 | 1.3 |
+| 2.9 | 1.2 |
+| 2.8.5 | 1.3 |
+| 2.8 | 1.1 |
+
+**Key rule:** Use the OADP version that ships with your ACM version. Do not upgrade OADP independently.
+
+**Override:** Set this annotation on MCH **before** enabling cluster-backup:
+```
+installer.open-cluster-management.io/oadp-subscription-spec: '{"channel": "stable-1.4"}'
+```
 
 ## Common Customer Issues and Triage
 
 ### 1. "Restore stuck in Error after temporary BSL outage"
 **Category:** Known limitation
 **Symptoms:** syncRestoreWithNewBackups: true, BSL went down temporarily, now back but Restore stays in Error
-**Root cause:** When BSL is unavailable, Velero restores fail with FailedValidation. The controller only syncs when phase is Enabled, but sets phase to Error on any Velero failure.
+**Root cause:** When BSL is unavailable, Velero restores fail with FailedValidation. The controller only syncs when phase is Enabled (code: `sync := isValidSync && restore.IsPhaseEnabled()`), but `setRestorePhase()` sets it to Error on any Velero failure — preventing auto-recovery.
 **Workaround:** Delete the failed Velero restore objects:
 ```
+oc -n open-cluster-management-backup get restores.velero.io
 oc -n open-cluster-management-backup delete restore.velero.io <failed-restore-name>
 ```
-After deletion, the controller will create new Velero restores and transition back to Enabled.
+After deletion, the controller will create new Velero restores on the next sync interval and transition back to Enabled. To speed up recovery, temporarily reduce `restoreSyncInterval`.
 **Status:** Enhancement proposed (EnabledWithErrors phase).
 
 ### 2. "BackupSchedule in BackupCollision"
 **Category:** Configuration issue
 **Symptoms:** BackupSchedule shows BackupCollision phase
-**Root cause:** Two scenarios:
+**Root cause:** The controller compares the `cluster.open-cluster-management.io/backup-cluster` label on the latest `acm-resources-schedule` backup against this hub's cluster ID. If they don't match, another hub wrote the latest backup. Two scenarios:
   - Two hubs have active BackupSchedules writing to the same storage location
-  - A passive hub ran a restore managed cluster activation while this hub's schedule was active
+  - A passive hub ran managed cluster activation while this hub's schedule was active
 **Resolution:** 
   - Ensure only ONE hub has an active BackupSchedule per storage location
   - Delete the BackupSchedule on the wrong hub, create a new one on the correct hub
   - Check `status.lastMessage` for which cluster ID is conflicting
+**Note:** If this hub ran a managed-clusters restore AFTER the foreign backup, collision is bypassed (DR failback scenario).
 
 ### 3. "BackupSchedule in FailedValidation"
 **Category:** Configuration issue
@@ -73,47 +157,46 @@ After deletion, the controller will create new Velero restores and transition ba
   1. Is the cron expression valid? (`spec.veleroSchedule`)
   2. Does a BackupStorageLocation exist? (`oc get bsl -n open-cluster-management-backup`)
   3. Is the BSL Available? (check BSL status phase)
-  4. Is there an active Restore running? (schedule cannot run while restore is active unless paused)
+  4. Is there an active Restore running? (schedule cannot run while restore is active unless schedule is paused)
   5. Is `useManagedServiceAccount: true` but MSA CRD not installed?
+**Error messages to look for:**
+  - "Schedule must be a non-empty valid Cron expression"
+  - "velero.io.BackupStorageLocation resources not found"
+  - "Backup storage location is not available"
+  - "Restore resource X is currently active"
+  - "UseManagedServiceAccount option cannot be used"
 
 ### 4. "Restore in FinishedWithErrors"
 **Category:** Could be config or issue
 **Check these:**
-  1. Is another Restore or BackupSchedule active? (only one active Restore allowed)
+  1. Is another Restore or BackupSchedule active? (only one active Restore allowed — second gets FinishedWithErrors with "currently active" message)
   2. Is `cleanupBeforeRestore` valid? (must be `None`, `CleanupRestored`, or `CleanupAll`)
   3. Check `status.lastMessage` for Velero `PartiallyFailed` — some resources may fail to restore but overall restore works
-  4. Velero PartiallyFailed is often normal for empty backup files (no resources matched the selector)
+  4. Velero PartiallyFailed is often **normal** for empty backup files (no resources matched the selector in `acm-resources-generic-schedule`)
 
 ### 5. "Managed clusters not reconnecting after restore"
 **Category:** Expected behavior / configuration
 **Key points:**
-  - Managed clusters reconnect at **activation time** (when `veleroManagedClustersBackupName` is set to `latest`)
-  - Passive sync (`veleroManagedClustersBackupName: skip`) does NOT activate clusters
-  - If using imported clusters (not Hive-created), auto-import requires ManagedServiceAccount to be enabled on the primary hub's BackupSchedule
-  - Check `status.messages` on the Restore for import details per cluster
-  - Clusters created via Hive (ClusterDeployment) reconnect automatically
-  - Imported clusters need either MSA auto-import or manual reimport
+  - Managed clusters reconnect at **activation time** only — when `veleroManagedClustersBackupName` is set to `latest`
+  - Passive sync (`veleroManagedClustersBackupName: skip`) does NOT activate clusters — this is by design
+  - **Hive-created clusters** (via ClusterDeployment) reconnect automatically because their kubeconfig is backed up
+  - **Imported clusters** need either:
+    - `useManagedServiceAccount: true` on the BackupSchedule (auto-import)
+    - Or manual creation of `auto-import-secret` under each managed cluster namespace
+  - Check `status.messages` on the Restore for per-cluster import details
+  - Non-OCP imported clusters (e.g., EKS) need `managedClusterClientConfigs.url` set on the ManagedCluster resource for auto-import to work
+  - If MSA token expired before restore, auto-import fails for that cluster (check Restore status messages)
 **Docs:** https://docs.redhat.com/en/documentation/red_hat_advanced_cluster_management_for_kubernetes/2.16/html/business_continuity/index
 **Blog:** https://developers.redhat.com/learn/openshift/move-managed-clusters-using-acm-212-backup-component
 
 ### 6. "What gets backed up? My resource X is not restored"
 **Category:** Informational
-**Backed up by default (no label needed):**
-  - Resources from these API groups: `*.open-cluster-management.io`, `*.hive.openshift.io`, `argoproj.io`, `app.k8s.io`
-  - ManagedCluster, ClusterDeployment, MachinePool, KlusterletAddonConfig, ManagedClusterAddon, etc.
-  - Secrets/ConfigMaps with Hive or ACM backup labels
-  - Policies (root policies only, not child/propagated policies)
-  - Placements, PlacementRules, PlacementBindings
-
-**NOT backed up by default (needs label):**
-  - Resources in excluded API groups (search, internal, work, admission, operator, etc.)
-  - User-created ConfigMaps/Secrets without backup labels
-  - Resources in the MCH namespace (unless labeled)
-  - AddonDeploymentConfig (excluded by default)
-  - Any custom resources not in the included API groups
-
-**How to include:** Add label `cluster.open-cluster-management.io/backup: ""` (or `cluster-activation` for activation-only data)
-**How to exclude:** Add label `velero.io/exclude-from-backup: "true"`
+See the [What Gets Backed Up](#what-gets-backed-up) section above for the complete list.
+**Common missed resources:**
+  - Secrets used by GitOps-created ClusterDeployments — need manual `cluster.open-cluster-management.io/backup` label
+  - Search CRs in MCH namespace — need the backup label to be included in generic backup
+  - AddonDeploymentConfig — excluded by default, needs backup label if user wants it preserved
+  - Resources in custom namespaces from non-ACM API groups — need the backup label
 
 ### 7. "Velero pod OOM / restore taking too long"
 **Category:** OADP team / resource tuning
@@ -132,33 +215,42 @@ spec:
             cpu: 500m
             memory: 256Mi
 ```
+**Scale reference (ACM 2.15, 3500+ SNO clusters):**
+- Backup: ~6 min total, ~111 MB
+- Restore (CleanupRestored): ~12 min
+- Recommended: cpu=4, memory=8Gi for very large hubs
 **Redirect to:** OADP team if Velero-specific tuning needed
-**Docs:** https://docs.redhat.com/en/documentation/red_hat_advanced_cluster_management_for_kubernetes/2.16/html/business_continuity/index#velero-resource-requests
 
 ### 8. "How to set up active/passive hub clusters"
 **Category:** Informational / setup guidance
+**Prerequisites:**
+  - Both hubs: same ACM version, same OCP version, same namespace layout
+  - Both hubs: same additional operators installed (GitOps, Ansible, cert-manager, etc.)
+  - Both hubs: `cluster-backup` enabled on MultiClusterHub
+  - Both hubs: DataProtectionApplication pointing to the same storage location (or replicated storage)
 **Steps:**
-  1. Install ACM on both hubs, same version, same namespace
-  2. Enable cluster-backup on both MCH
-  3. Create DataProtectionApplication on both, pointing to same storage
-  4. Create BackupSchedule on primary hub only
-  5. Create passive sync Restore on secondary hub:
+  1. Create BackupSchedule on primary hub only
+  2. Create passive sync Restore on secondary hub:
      ```yaml
      spec:
        syncRestoreWithNewBackups: true
        restoreSyncInterval: 10m
+       cleanupBeforeRestore: CleanupRestored
        veleroManagedClustersBackupName: skip
        veleroCredentialsBackupName: latest
        veleroResourcesBackupName: latest
      ```
-  6. When disaster strikes, set `veleroManagedClustersBackupName: latest` on secondary to activate
+  3. When disaster strikes: edit the Restore to set `veleroManagedClustersBackupName: latest`
+  4. Wait for Finished, then create BackupSchedule on the new active hub
+**Important:** Do not create a second Restore — edit the existing one. The webhook enforces a two-step workflow: create with `skip`, then update to `latest`.
 **Blog:** https://www.redhat.com/en/blog/backup-and-restore-hub-clusters-with-red-hat-advanced-cluster-management-for-kubernetes
 **Blog:** https://www.redhat.com/en/blog/how-to-move-from-standalone-rhacm-to-an-active/passive-setup
 
 ### 9. "OADP version compatibility"
 **Category:** Informational
-**Key rule:** Use the OADP version that ships with your ACM version. Do not upgrade OADP independently.
-**Override:** MCH annotation `mch-imageOverridesCM` can override OADP channel if needed.
+See the [OADP Version Compatibility](#oadp-version-compatibility) table above.
+**Override annotation:** `installer.open-cluster-management.io/oadp-subscription-spec`
+**Note:** OADP CRDs are cluster-scoped — you cannot have multiple versions on the same cluster. All namespaces must use the same version.
 **Redirect to:** OADP team for OADP-specific bugs
 
 ### 10. "Moving managed clusters between two non-identical hubs"
@@ -169,40 +261,32 @@ spec:
 - The two hubs are NOT identical — different apps, policies, resources
 - Full restore would overwrite existing resources on hub2 or create new ones
 - `cleanupBeforeRestore: CleanupAll` would remove hub2's own managed clusters
-- Even `CleanupRestored` is risky if a prior restore was done (hub2's clusters could get tagged)
+- Even `CleanupRestored` is risky if a prior restore was done (hub2's clusters could get tagged with `velero.io/backup-name` and cleaned up)
 - Policies/placements from hub1 could unexpectedly apply to hub2's clusters
 
-**Correct approach:** Use the "move managed clusters" procedure:
-- Blog: https://developers.redhat.com/learn/openshift/move-managed-clusters-using-acm-212-backup-component
-- Only move the managed cluster activation data, not all hub content
-- Both hubs MUST have identical policies/apps for any placement that could match moved clusters
+**Correct approach:** Use the "move managed clusters" procedure — only move activation data, not all hub content. Both hubs MUST have identical policies/apps for any placement that could match moved clusters.
 
 **Uncontrolled failover (hub1 dies without preparation):**
-- ACM 2.14+ has `ImportOnly` import strategy (set by default on new installs)
-- `ImportOnly` prevents the hub from re-importing clusters it already knows about, avoiding flip-flop
-- If upgrading from older ACM, verify `ImportOnly` is set
+- ACM 2.14+ has `ImportOnly` import strategy (default on new installs) — prevents the hub from re-importing clusters it already knows about
 - For ACM < 2.14, there is no workaround for uncontrolled DR
 
-**Strong recommendation:** Full active/passive with identical hubs is the supported, well-tested path. If two independent hubs must exist (e.g., network/latency constraints), treat them as separate ACM domains.
-
-**Cleanup is optional:** After moving clusters, cleaning up on the source hub is a choice, not a requirement. The doc says "you can choose to clean up" — don't advise customers they MUST do it.
+**Strong recommendation:** Full active/passive with identical hubs is the supported, well-tested path.
+**Cleanup is optional** — the doc says "you can choose to clean up."
+**Blog:** https://developers.redhat.com/learn/openshift/move-managed-clusters-using-acm-212-backup-component
 
 ### 11. "Primary hub still running, want to move clusters to new hub"
 **Category:** Informational / procedure
-**This is NOT a disaster scenario.** Both hubs are running.
 **Steps:**
   1. On primary: ensure BackupSchedule is Enabled, latest backup is recent
   2. On primary: prepare the hub (follow "Prepare the primary hub" steps)
   3. On new hub: create Restore to move managed clusters
   4. Cleanup on primary is optional
-**Note:** If using ACM 2.14+, the `ImportOnly` strategy eliminates the need for the prepare step in uncontrolled scenarios.
+**ACM 2.14+:** `ImportOnly` strategy eliminates the need for the prepare step in uncontrolled scenarios.
 **Blog:** https://developers.redhat.com/learn/openshift/move-managed-clusters-using-acm-212-backup-component
-**Docs:** https://docs.redhat.com/en/documentation/red_hat_advanced_cluster_management_for_kubernetes/2.16/html/business_continuity/index#restore-primary-active
 
 ### 12. "Application data backup on managed clusters"
-**Category:** Out of scope (informational)
-**This operator does NOT backup application data on managed clusters.** It only backs up hub cluster configuration.
-For application data DR, use OADP/Velero policies deployed via ACM policies to managed clusters.
+**Category:** Out of scope
+**This operator does NOT backup application data on managed clusters.** It only backs up hub cluster configuration. For application data DR, use OADP/Velero policies deployed to managed clusters via ACM policies.
 **Blog:** https://www.redhat.com/en/blog/back-up-and-restore-application-persistent-data-with-red-hat-advanced-cluster-management-for-kubernetes-policies
 
 ### 13. "Restore validation webhook rejection"
@@ -213,11 +297,30 @@ For application data DR, use OADP/Velero policies deployed via ACM policies to m
   - `veleroCredentialsBackupName` must be `latest`
   - `veleroResourcesBackupName` must be `latest`
   - On initial create, `veleroManagedClustersBackupName` must be `skip`
-  - To activate, edit the existing Restore to change from `skip` to `latest`
+  - To activate, edit the existing Restore to change from `skip` to `latest` (only allowed when phase is Enabled)
+**Note:** The webhook only applies when `syncRestoreWithNewBackups` is true. Non-sync restores can use any valid backup name.
+
+### 14. "Cross-datacenter DR with separate S3 buckets per site"
+**Category:** Architecture guidance
+**Scenario:** Customer has two data centers and wants each to have its own S3 storage rather than sharing a single bucket.
+**Solution:** Use S3 cross-datacenter replication. Each hub writes to its local S3, and a replication layer copies data to the other site. Options:
+  - AWS S3 Cross-Region Replication (async, < 15 min)
+  - MinIO bucket replication (near-real-time)
+  - Noobaa MCG mirror (synchronous, ODF required)
+**Key points:**
+  - Use one-way replication (active → passive), reverse on failover
+  - Set `restoreSyncInterval` to at least 2x the replication lag
+  - Prefix must match on both hubs' DPA configuration
+  - No new ACM features needed — this is a storage-layer solution
+
+### 15. "`local-cluster` settings not restored"
+**Category:** Expected behavior
+Settings for the `local-cluster` managed cluster resource (such as owning managed cluster set) are not backed up or restored because they contain cluster-specific information. Any customizations to `local-cluster` on the primary hub must be manually applied on the restored hub.
 
 ## Cluster Role Assessment
 
-Use the `assess-acm-backup-config` skill/script to determine the cluster's role and health. Source: https://github.com/birsanv/samples/blob/main/skills/assess-acm-backup-config/SKILL.md
+Use the `assess-acm-backup-config` skill/script to determine a cluster's role and health.
+Source: https://github.com/birsanv/samples/blob/main/skills/assess-acm-backup-config/SKILL.md
 
 ### How to Determine Cluster Role
 
@@ -225,7 +328,7 @@ The primary indicator is the **heartbeat backup** (`acm-validation-policy-schedu
 
 | Role | How Detected |
 |------|-------------|
-| **ACTIVE HUB** | Latest heartbeat backup's `backup-cluster` label matches this cluster's ID |
+| **ACTIVE HUB** | Latest heartbeat's `backup-cluster` label matches this cluster's ID |
 | **ACTIVE HUB (paused)** | Heartbeat matches but BackupSchedule is paused |
 | **ACTIVE HUB (collision)** | Heartbeat matches but another cluster also started writing |
 | **PASSIVE HUB** | Has a Restore with `veleroManagedClustersBackupName: skip` |
@@ -234,7 +337,7 @@ The primary indicator is the **heartbeat backup** (`acm-validation-policy-schedu
 | **FAILOVER / ACTIVATION** | Restore with `veleroManagedClustersBackupName` != skip |
 | **NOT CONFIGURED** | No BackupSchedule or Restore found |
 
-### Key Labels for Backup Ownership
+### Key Labels
 
 | Label | Purpose |
 |-------|---------|
@@ -242,24 +345,18 @@ The primary indicator is the **heartbeat backup** (`acm-validation-policy-schedu
 | `cluster.open-cluster-management.io/restore-cluster` | Hub that ran managed-clusters restore (failover) |
 | `velero.io/schedule-name` | Velero schedule that created the backup |
 | `cluster.open-cluster-management.io/backup-schedule-type` | Type: credentials, resources, managed-clusters |
-
-### Velero Schedule Names
-
-| Schedule | Contents |
-|----------|----------|
-| `acm-credentials-schedule` | Secrets, ConfigMaps (credentials) |
-| `acm-resources-schedule` | Applications, policies, placements |
-| `acm-resources-generic-schedule` | User-labeled generic resources |
-| `acm-managed-clusters-schedule` | ManagedCluster activation data |
-| `acm-validation-policy-schedule` | Cron heartbeat (short TTL) |
+| `velero.io/backup-name` | Set on restored resources, used by CleanupRestored |
 
 ### Governance Policy Validation (`backup-restore-enabled`)
 
-This policy is installed by the backup Helm chart. When NonCompliant, check these templates:
+This policy is installed by the backup Helm chart on both hubs. It validates backup health on the active hub and OADP readiness on the passive hub. When NonCompliant, check these templates:
 
 | Template | What it checks |
 |----------|---------------|
+| `acm-cluster-backup-enabled` | cluster-backup component enabled in MCH |
 | `oadp-operator-exists` | OADP operator installed in backup namespace |
+| `oadp-channel-validation` | OADP version matches expected version |
+| `custom-oadp-channel-validation` | OADP in other namespaces matches backup namespace version |
 | `acm-backup-pod-running` | Backup operator pod is running |
 | `oadp-pod-running` | OADP operator pod is running |
 | `velero-pod-running` | Velero pod is running |
@@ -270,9 +367,12 @@ This policy is installed by the backup Helm chart. When NonCompliant, check thes
 | `acm-managed-clusters-schedule-backups-available` | Velero backups exist at storage |
 | `acm-backup-in-progress-report` | No backups stuck in InProgress |
 | `backup-schedule-cron-enabled` | Primary hub actively generating new backups |
-| `oadp-channel-validation` | OADP version matches expected version |
+| `auto-import-account-secret` | MSA secret exists in managed cluster namespaces |
+| `auto-import-backup-label` | MSA secrets have the backup label |
 
 **Note:** If hub self-management is disabled (`disableHubSelfManagement=true`), the policy won't be placed on the hub. Set `is-hub=true` label on the local ManagedCluster to enable it.
+
+The policy is also automatically enabled on managed hubs in a global hub scenario (clusters with the `feature.open-cluster-management.io/addon-multicluster-global-hub-controller` label).
 
 ### Common Diagnostic Scenarios
 
@@ -309,6 +409,12 @@ oc get bsl -n open-cluster-management-backup -o yaml
 
 # Policy compliance
 oc get policy backup-restore-enabled -n open-cluster-management-backup -o yaml
+
+# Check Velero pod logs
+oc logs -n open-cluster-management-backup -l app.kubernetes.io/name=velero --tail=100
+
+# Check operator pod logs
+oc logs -n open-cluster-management-backup -l app=cluster-backup-chart-clusterbackup --tail=100
 ```
 
 ## Information to Collect for Bug Reports
@@ -316,19 +422,22 @@ oc get policy backup-restore-enabled -n open-cluster-management-backup -o yaml
 When a customer issue looks like a potential bug, ask for:
 
 1. **ACM version:** `oc get mch -n open-cluster-management -o jsonpath='{.items[0].status.currentVersion}'`
-2. **OADP version:** `oc get csv -n open-cluster-management-backup | grep oadp`
-3. **BackupSchedule or Restore status:** `oc get <resource> -n open-cluster-management-backup -o yaml`
-4. **Velero backup/restore status:** `oc get backups.velero.io -n open-cluster-management-backup` or `oc get restores.velero.io -n open-cluster-management-backup`
-5. **BSL status:** `oc get bsl -n open-cluster-management-backup`
-6. **Operator pod logs:** `oc logs -n open-cluster-management-backup -l app=cluster-backup-chart-clusterbackup`
-7. **Velero pod logs:** `oc logs -n open-cluster-management-backup -l app.kubernetes.io/name=velero`
-8. **Events:** `oc get events -n open-cluster-management-backup --sort-by='.lastTimestamp'`
+2. **OCP version:** `oc get clusterversion version -o jsonpath='{.status.desired.version}'`
+3. **OADP version:** `oc get csv -n open-cluster-management-backup | grep oadp`
+4. **BackupSchedule or Restore status:** `oc get <resource> -n open-cluster-management-backup -o yaml`
+5. **Velero backup/restore status:** `oc get backups.velero.io -n open-cluster-management-backup` or `oc get restores.velero.io -n open-cluster-management-backup`
+6. **BSL status:** `oc get bsl -n open-cluster-management-backup`
+7. **Operator pod logs:** `oc logs -n open-cluster-management-backup -l app=cluster-backup-chart-clusterbackup`
+8. **Velero pod logs:** `oc logs -n open-cluster-management-backup -l app.kubernetes.io/name=velero`
+9. **Events:** `oc get events -n open-cluster-management-backup --sort-by='.lastTimestamp'`
+10. **Policy status:** `oc get policy backup-restore-enabled -n open-cluster-management-backup -o yaml`
 
-## Useful Doc Links
+## Useful Links
 
-- Official docs: https://docs.redhat.com/en/documentation/red_hat_advanced_cluster_management_for_kubernetes/2.16/html/business_continuity/index
-- Setup blog: https://www.redhat.com/en/blog/backup-and-restore-hub-clusters-with-red-hat-advanced-cluster-management-for-kubernetes
-- Active/passive migration: https://www.redhat.com/en/blog/how-to-move-from-standalone-rhacm-to-an-active/passive-setup
-- App data backup policies: https://www.redhat.com/en/blog/back-up-and-restore-application-persistent-data-with-red-hat-advanced-cluster-management-for-kubernetes-policies
-- Move managed clusters tutorial: https://developers.redhat.com/learn/openshift/move-managed-clusters-using-acm-212-backup-component
-- GitHub repo: https://github.com/stolostron/cluster-backup-operator
+- **Official docs:** https://docs.redhat.com/en/documentation/red_hat_advanced_cluster_management_for_kubernetes/2.16/html/business_continuity/index
+- **GitHub repo:** https://github.com/stolostron/cluster-backup-operator
+- **Setup blog:** https://www.redhat.com/en/blog/backup-and-restore-hub-clusters-with-red-hat-advanced-cluster-management-for-kubernetes
+- **Active/passive migration blog:** https://www.redhat.com/en/blog/how-to-move-from-standalone-rhacm-to-an-active/passive-setup
+- **App data backup policies blog:** https://www.redhat.com/en/blog/back-up-and-restore-application-persistent-data-with-red-hat-advanced-cluster-management-for-kubernetes-policies
+- **Move managed clusters tutorial:** https://developers.redhat.com/learn/openshift/move-managed-clusters-using-acm-212-backup-component
+- **Cluster assessment skill:** https://github.com/birsanv/samples/blob/main/skills/assess-acm-backup-config/SKILL.md
