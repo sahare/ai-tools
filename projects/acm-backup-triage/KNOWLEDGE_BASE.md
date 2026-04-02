@@ -320,7 +320,6 @@ Settings for the `local-cluster` managed cluster resource (such as owning manage
 ## Cluster Role Assessment
 
 Use the `assess-acm-backup-config` skill/script to determine a cluster's role and health.
-Source: https://github.com/birsanv/samples/blob/main/skills/assess-acm-backup-config/SKILL.md
 
 ### How to Determine Cluster Role
 
@@ -440,4 +439,3 @@ When a customer issue looks like a potential bug, ask for:
 - **Active/passive migration blog:** https://www.redhat.com/en/blog/how-to-move-from-standalone-rhacm-to-an-active/passive-setup
 - **App data backup policies blog:** https://www.redhat.com/en/blog/back-up-and-restore-application-persistent-data-with-red-hat-advanced-cluster-management-for-kubernetes-policies
 - **Move managed clusters tutorial:** https://developers.redhat.com/learn/openshift/move-managed-clusters-using-acm-212-backup-component
-- **Cluster assessment skill:** https://github.com/birsanv/samples/blob/main/skills/assess-acm-backup-config/SKILL.md
