@@ -569,3 +569,138 @@ The following aspects were not verified due to the test environment setup and sh
 - **DR testing procedure**: The "tag resources" step (one-time Restore with `cleanupBeforeRestore: None`) from the non-destructive DR testing section was not tested.
 - **Observability failover**: Thanos compactor shutdown and `observatorium` resource preservation were not tested.
 - **Large-scale performance**: The test used minimal hub data. For hubs managing 1000+ clusters, Velero resource limits may need tuning and backup/restore times will be longer.
+
+---
+
+## Appendix: QE Verification Test Plan
+
+This section provides a comprehensive test plan for QE to verify the cross-datacenter DR architecture in a production-like environment, addressing the limitations of the initial verification.
+
+### Recommended Test Environment
+
+| | DC1 (Active Hub) | DC2 (Passive Hub) |
+|---|---|---|
+| **OCP** | 4.21+ | 4.21+ (same version) |
+| **ACM** | 2.17+ | 2.17+ (same version) |
+| **Managed Clusters** | 3-5 clusters (mix of Hive-created and imported) | None initially |
+| **Additional Operators** | OpenShift GitOps (ArgoCD) | OpenShift GitOps (ArgoCD) |
+| **MSA** | Enabled (`useManagedServiceAccount: true`) | N/A |
+| **S3 Storage** | AWS S3 bucket in us-east-1 | AWS S3 bucket in us-west-2 |
+| **S3 Replication** | AWS S3 Cross-Region Replication (CRR) | Replica target |
+
+**Why this setup:**
+- AWS S3 CRR is the most common customer deployment — tests real async replication with actual lag
+- Mix of Hive + imported clusters tests both auto-reconnect paths
+- GitOps/ArgoCD tests the Application/ApplicationSet restore behavior
+- MSA enabled tests auto-import for imported clusters
+- Two different AWS regions simulates real cross-datacenter separation
+
+### Test Cases
+
+**TC1: Basic Setup and Passive Sync**
+1. Configure S3 CRR from DC1 bucket to DC2 bucket
+2. Create DPA on both hubs with matching prefix, pointing to local bucket
+3. Verify BSL Available on both
+4. Create BackupSchedule on DC1, verify Enabled and 5 Velero schedules created
+5. Wait for first backup cycle to complete
+6. Verify backups replicated to DC2 bucket (check S3 console or `aws s3 ls`)
+7. Verify DC2 Velero discovers replicated backups
+8. Create passive sync Restore on DC2, verify reaches Enabled
+9. Trigger a second backup cycle and verify DC2 syncs the new backups
+
+**TC2: Failover with Managed Cluster Reconnection**
+1. Verify managed clusters are Available on DC1 (mix of Hive and imported)
+2. Patch DC2 Restore: `veleroManagedClustersBackupName: skip → latest`
+3. Verify Restore reaches Finished
+4. Verify Hive-created clusters reconnect to DC2 automatically
+5. Verify imported clusters with MSA reconnect to DC2 automatically
+6. Verify any imported clusters without MSA show as Pending Import
+7. Verify managed clusters show as Unknown/disconnected on DC1
+8. Create BackupSchedule on DC2, verify Enabled
+9. Delete BackupSchedule on DC1
+
+**TC3: ImportOnly Strategy**
+1. Verify `ImportOnly` is set on DC1 (check `import-controller-config` ConfigMap)
+2. After failover, verify DC1 does NOT try to re-import clusters that became Unknown
+3. Test with `ImportAndSync` as well — verify DC1 DOES try to reconnect (for comparison)
+
+**TC4: Replication Lag Behavior**
+1. Configure `restoreSyncInterval: 5m` on DC2
+2. Monitor S3 CRR replication lag via CloudWatch metrics
+3. Trigger a backup and measure time until DC2's passive sync picks it up
+4. Verify no partial/corrupt restore when sync happens during replication
+5. Test with `restoreSyncInterval` shorter than replication lag — document behavior
+
+**TC5: Failback (Return to DC1)**
+1. Reverse S3 CRR direction (DC2 → DC1)
+2. Wait for DC2 backups to replicate to DC1
+3. Create Restore on DC1 with `CleanupRestored`, all three `latest`
+4. Verify Restore reaches Finished
+5. Verify managed clusters reconnect to DC1
+6. Create BackupSchedule on DC1
+7. Delete BackupSchedule on DC2, create passive sync Restore on DC2
+8. Reverse S3 CRR back to DC1 → DC2
+9. Verify DC2 passive Restore reaches Enabled
+10. Verify managed clusters are Available on DC1
+
+**TC6: Collision Detection**
+1. Intentionally leave BackupSchedule active on both hubs
+2. Verify one hub detects BackupCollision
+3. Verify the `backup-restore-enabled` policy reports the collision
+4. Resolve by deleting schedule on the wrong hub and recreating on the correct hub
+
+**TC7: Non-Destructive DR Testing Procedure**
+1. Pause BackupSchedule on DC1
+2. Create one-time Restore with `cleanupBeforeRestore: None` to tag resources
+3. Wait for Finished, delete the Restore
+4. Disable auto-import on managed clusters (or verify ImportOnly is set)
+5. Activate DC2 (patch Restore to latest)
+6. Verify managed clusters reconnect to DC2
+7. Run failback to DC1
+8. Verify all resources intact on DC1, managed clusters reconnected, no data loss
+
+**TC8: ArgoCD Applications Behavior**
+1. Deploy Applications and ApplicationSets on DC1 via GitOps
+2. Verify they are backed up (part of `argoproj.io` API group)
+3. After passive sync, verify Applications are restored on DC2
+4. Check whether ArgoCD on DC2 attempts to sync/deploy restored Applications
+5. Test with `cluster-activation` label on Applications — verify they are NOT restored during passive sync but ARE restored during activation
+6. Compare RTO: restore from backup vs GitOps re-deploy
+
+**TC9: CleanupRestored with Excluded Resources**
+1. Add `velero.io/exclude-from-backup: true` to some Applications on DC1
+2. Run a full failover → failback cycle
+3. Verify excluded Applications survive `CleanupRestored` on rollback
+4. Verify excluded Applications survive `CleanupAll` (should be skipped due to exclude label)
+
+**TC10: Governance Policy Validation**
+1. Verify `backup-restore-enabled` policy is Compliant on both hubs during normal operation
+2. Verify policy detects issues during each phase (missing BSL, collision, stuck backups)
+3. Test with `disableHubSelfManagement: true` — verify policy requires `is-hub=true` label
+
+**TC11: Observability Failover (if enabled)**
+1. Enable MultiClusterObservability on DC1
+2. Backup the `observatorium` resource
+3. After failover, restore `observatorium` on DC2
+4. Apply MultiClusterObservability CR on DC2
+5. Verify metrics ingestion resumes from managed clusters
+6. Verify tenant ID is preserved
+
+**TC12: Scale Test (optional)**
+1. Attach 100+ managed clusters to DC1
+2. Run full failover → failback cycle
+3. Measure backup size, replication time, restore time, cluster reconnection time
+4. Verify Velero resource limits are adequate or document required tuning
+
+### Acceptance Criteria
+
+- [ ] Full failover → failback cycle completes with managed clusters reconnecting successfully
+- [ ] Hive-created clusters auto-reconnect on failover and failback
+- [ ] Imported clusters with MSA auto-reconnect on failover and failback
+- [ ] ImportOnly prevents old hub from reclaiming clusters after uncontrolled failover
+- [ ] S3 replication lag does not cause corrupt or partial restores
+- [ ] BackupCollision is detected and reported when both hubs write simultaneously
+- [ ] CleanupRestored does not delete resources excluded from backup
+- [ ] Non-destructive DR test completes with no data loss
+- [ ] Governance policy reports correct status at all phases
+- [ ] Document is updated with any corrections found during testing
