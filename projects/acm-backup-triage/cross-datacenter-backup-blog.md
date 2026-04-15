@@ -36,6 +36,21 @@ flowchart TB
   Hub1 -. "manages" .-> MC_D
 ```
 
+### Data flow during normal operation
+
+```mermaid
+sequenceDiagram
+    participant Hub1 as Active Hub (DC1)
+    participant S3_DC1 as S3 Bucket (DC1)
+    participant S3_DC2 as S3 Bucket (DC2)
+    participant Hub2 as Passive Hub (DC2)
+
+    Hub1->>S3_DC1: 1. BackupSchedule runs on schedule
+    S3_DC1->>S3_DC2: 2. S3 replication copies new backup objects
+    S3_DC2->>Hub2: 3. Passive Restore detects new backups
+    Note over Hub2: Has latest policies, apps,<br/>credentials (but NOT<br/>cluster activation data)
+```
+
 Key points:
 - Each hub uses a **local** S3 bucket — no cross-site storage dependency
 - S3 replication is **one-way** (active → passive), reversed on failover
@@ -259,16 +274,30 @@ For the full failback procedure, see [Restoring data to the initial hub cluster]
 You can test failover without permanently losing control of managed clusters:
 
 1. **Pause** the BackupSchedule on DC1.
-2. For ACM versions before 2.14, disable auto-import on managed clusters:
+2. **Tag existing resources** on DC1 so they can be properly cleaned up later by `CleanupRestored`. Create a one-time Restore on DC1:
+   ```yaml
+   apiVersion: cluster.open-cluster-management.io/v1beta1
+   kind: Restore
+   metadata:
+     name: restore-tag-resources
+     namespace: open-cluster-management-backup
+   spec:
+     cleanupBeforeRestore: None
+     veleroManagedClustersBackupName: latest
+     veleroCredentialsBackupName: latest
+     veleroResourcesBackupName: latest
+   ```
+   Wait for it to finish, then delete it.
+3. For ACM versions before 2.14, disable auto-import on managed clusters:
    ```bash
    for mc in $(oc get managedcluster -o name); do
      oc annotate $mc import.open-cluster-management.io/disable-auto-import='' --overwrite
    done
    ```
    ACM 2.14+ with `ImportOnly` does not require this step.
-3. **Activate** the passive hub (DC2) using the failover steps above.
-4. **Test**: Verify managed clusters are `Available`, policies apply, apps deploy.
-5. **Return** to DC1 using the failback steps above.
+4. **Activate** the passive hub (DC2) using the failover steps above.
+5. **Test**: Verify managed clusters are `Available`, policies apply, apps deploy.
+6. **Return** to DC1 using the failback steps above.
 
 > Monitor the `backup-restore-enabled` policy on both hubs. It validates that backups are running, BSL is available, and no collisions exist. If hub self-management is disabled, set the `is-hub=true` label on the local `ManagedCluster` to enable the policy.
 
@@ -373,6 +402,16 @@ The ACM operator detects when two hubs write to the same storage and sets the sc
 
 **Prevention**: Only one hub should have an active BackupSchedule. Always delete or pause the schedule on the old primary before or after failover. Use one-way replication and reverse it only during failover.
 
+**If `BackupCollision` is detected:**
+1. Identify which hub is the legitimate active hub
+2. Delete the `BackupSchedule` on the wrong hub
+3. On the correct hub, delete the collided `BackupSchedule` and create a new one to resume backups
+
+```bash
+# Check for collision on any hub
+oc get backupschedule -n open-cluster-management-backup
+```
+
 ### Velero TTL and replication
 
 Velero deletes expired backups based on `veleroTtl`. With async replication, these deletions may not propagate to the replica:
@@ -383,10 +422,22 @@ Velero deletes expired backups based on `veleroTtl`. With async replication, the
 
 ### Network requirements
 
+**Managed cluster connectivity:**
 - Both hubs need outbound access to all managed cluster API servers (port 6443)
 - Managed clusters need outbound access to both hub API servers
+- If managed clusters are split across DCs, cross-DC network links must support the management traffic
 - Consider a Global Load Balancer or DNS-based failover for seamless cluster reconnection
 - Alternatively, `useManagedServiceAccount: true` auto-reconnects imported clusters without DNS changes
+
+**S3 replication network:**
+
+| Replication Method | Network Requirement |
+|---|---|
+| AWS S3 CRR | No user-managed network (AWS handles it internally) |
+| MinIO | HTTPS connectivity between MinIO clusters |
+| Noobaa MCG | Network path between MCG instances or shared cloud store access |
+
+Ensure S3 replication traffic is encrypted in transit (TLS) and bandwidth between DCs is sufficient for the backup data volume.
 
 ### Bandwidth estimation
 
@@ -414,6 +465,12 @@ Technically possible, but both hubs would see each other's backups, which can tr
 
 **What if S3 replication lags behind?**
 The passive hub restores from a slightly older backup. Minimize risk by running backups more frequently and monitoring replication lag.
+
+**Can managed clusters in DC2 connect to the hub in DC1?**
+Yes, as long as network connectivity is in place. Managed clusters use outbound connections to the hub API server. The physical location of the managed cluster does not matter — it can be in either data center as long as it can reach the active hub.
+
+**How do I validate the setup before a real disaster?**
+Use the non-destructive DR testing procedure described above. Additionally, regularly check the `backup-restore-enabled` policy on both hubs for violations, verify S3 replication status with your storage provider's monitoring tools, and periodically test restoring a backup on the passive hub to confirm data integrity.
 
 **What about Hosted Control Planes?**
 The backup covers management configuration. Hosted control planes need a [separate backup strategy](https://docs.redhat.com/en/documentation/red_hat_advanced_cluster_management_for_kubernetes/2.16/html/business_continuity/business-cont-overview#backup-and-restore-for-hosted-control-plane-overview).
