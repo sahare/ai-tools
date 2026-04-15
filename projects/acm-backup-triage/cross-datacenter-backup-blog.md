@@ -492,19 +492,41 @@ It's a good choice if you already use ODF. For AWS, S3 CRR is simpler. For on-pr
 
 ## Appendix: Verification Test Summary
 
-This architecture was verified end-to-end on live OpenShift clusters.
+This architecture was verified end-to-end on live OpenShift clusters with a full failover → failback cycle.
 
 ### Test Environment
 
 | | Cluster 1 (DC1 - Active) | Cluster 2 (DC2 - Passive) |
 |---|---|---|
+| **Cluster** | app-prow-small-aws-421-west2-pthps | app-prow-small-aws-421-west2-mnq28 |
 | **OCP** | 4.21.0 | 4.21.0 |
-| **ACM** | 2.17.0 | 2.17.0 |
+| **ACM** | 2.17.0-77 | 2.17.0-150 |
 | **OADP** | 1.5.5 | 1.5.5 |
-| **S3 Storage** | MinIO (local, in-cluster) | MinIO (local, in-cluster) |
+| **Region** | us-west-2 | us-west-2 |
+| **S3 Storage** | MinIO (local, in-cluster, 20Gi PVC) | MinIO (local, in-cluster, 20Gi PVC) |
 | **Bucket** | acm-backups (prefix: hub-backup) | acm-backups (prefix: hub-backup) |
 
-S3 replication was configured using `mc mirror --watch` running as a Deployment, syncing from the active hub's MinIO to the passive hub's MinIO via external routes. Replication direction was reversed during failover and failback.
+### Environment Setup
+
+**MinIO deployment (each cluster):**
+- MinIO deployed as a single-replica Deployment in the `minio` namespace with a 20Gi PVC
+- Exposed via OpenShift Routes (TLS edge termination) for cross-cluster access
+- Bucket `acm-backups` created with versioning enabled on both instances
+- Credentials: `minioadmin` / `minioadmin123`
+
+**S3 replication:**
+- Single-node MinIO does not support server-side bucket replication (requires distributed mode)
+- Used `mc mirror --watch --overwrite --remove` as a Deployment on the active hub's cluster
+- Mirrors from local MinIO (`http://minio.minio.svc:9000`) to remote MinIO via the external route
+- Replication verified with a test file — appeared on DC2 within seconds
+- Replication direction reversed by deleting and recreating the mirror Deployment with swapped source/target
+
+**ACM configuration (each cluster):**
+- `cluster-backup` enabled on MultiClusterHub
+- Storage credentials (`cloud-credentials` Secret) created in `open-cluster-management-backup`
+- DataProtectionApplication (`dpa-hub`) pointing to local MinIO with `s3ForcePathStyle: true` and matching `hub-backup` prefix
+- BackupStorageLocation confirmed `Available` on both hubs before proceeding
+- BackupSchedule used `*/10 * * * *` (every 10 minutes) and `veleroTtl: 24h` for faster test cycles
 
 ### Verified Steps
 
@@ -512,21 +534,38 @@ S3 replication was configured using `mc mirror --watch` running as a Deployment,
 |-------|--------|--------|
 | **Setup** | DPA + BSL on both hubs pointing to local MinIO | BSL Available on both |
 | **Backup** | BackupSchedule on DC1 (10-min interval) | Enabled, 5 Velero backups completed |
-| **Replication** | mc mirror DC1 → DC2 | All backup files synced to DC2's MinIO |
-| **Discovery** | DC2 Velero discovers replicated backups | All 5 backups visible with Completed status |
-| **Passive sync** | Restore on DC2 with MC=skip, sync=true | Reached Enabled, syncing with new backups |
-| **Failover activation** | Patch Restore MC: skip → latest | Webhook accepted, phase: Enabled → Running → Finished |
-| **DC2 active** | Create BackupSchedule on DC2, delete on DC1 | Schedule Enabled, no collision |
-| **Reverse replication** | mc mirror DC2 → DC1 | DC2 backups synced to DC1's MinIO |
-| **Failback** | Restore on DC1 with CleanupRestored, all latest | Finished successfully |
-| **DC1 active again** | BackupSchedule on DC1, passive Restore on DC2 | Both Enabled |
-| **Original state** | Replication DC1 → DC2, DC2 passive sync | Verified — full cycle complete |
+| **Replication** | mc mirror DC1 → DC2 | All backup files synced to DC2's MinIO in near-real-time |
+| **Discovery** | DC2 Velero discovers replicated backups from its local storage | All 5 backups visible with Completed status |
+| **Passive sync** | Restore on DC2 with MC=skip, sync=true, CleanupRestored | Reached **Enabled** — "restore will continue to sync with new backups" |
+| **Failover activation** | `oc patch restore ... veleroManagedClustersBackupName: latest` | Webhook accepted, phase: Enabled → Running → **Finished** |
+| **Velero restores created** | 9 Velero restores including `-active` suffix for activation data | All Completed |
+| **DC2 becomes active** | Create BackupSchedule on DC2 | **Enabled**, producing backups |
+| **DC1 cleanup** | Delete BackupSchedule on DC1 | Deleted, no collision |
+| **Reverse replication** | Recreate mc mirror as DC2 → DC1 | DC2 backups synced to DC1's MinIO |
+| **DC1 discovers DC2 backups** | DC1 Velero discovers backups from reversed replication | All DC2 backups visible |
+| **Failback restore** | Restore on DC1 with CleanupRestored, all three `latest` | **Finished** — "All Velero restores have run successfully" |
+| **DC1 active again** | Create BackupSchedule on DC1 | **Enabled** |
+| **DC2 back to passive** | Delete BackupSchedule + old Restore on DC2, create new passive sync Restore | Passive Restore reached **Enabled** |
+| **Original state restored** | Recreate mc mirror as DC1 → DC2 | Full cycle complete, original configuration restored |
 
 ### Key Findings
 
-- Each hub successfully uses its own independent S3 storage with matching prefix
-- Velero on the passive hub correctly discovers and restores backups that arrived via replication
-- The two-step activation workflow (create with `skip`, patch to `latest`) works as documented
-- A completed Restore (`Finished`) does not block creating a new BackupSchedule
-- One-way replication structurally prevents backup collision
-- No ACM code changes required — this pattern works with existing capabilities
+- Each hub successfully uses its own independent S3 storage with matching prefix — the core cross-datacenter pattern works
+- Velero on the passive hub correctly discovers and restores backups that arrived via replication (not written by local Velero)
+- The two-step activation workflow (create with `skip`, patch to `latest`) works as documented — webhook accepts the update when phase is Enabled
+- A completed Restore (`Finished` phase) does not block creating a new BackupSchedule — no need to delete the Restore first
+- One-way replication structurally prevents backup collision — no collision detected throughout the entire cycle
+- Replication reversal is the only manual storage-layer step during failover/failback
+- No ACM code changes required — this pattern works with existing backup/restore operator capabilities
+
+### Limitations of This Test
+
+The following aspects were not verified due to the test environment setup and should be tested separately in a production-like environment:
+
+- **Managed cluster reconnection**: No managed clusters were attached to either hub during the test. Hive auto-reconnect and ManagedServiceAccount auto-import for imported clusters were not tested. These are standard active/passive behaviors documented in the [official docs](https://docs.redhat.com/en/documentation/red_hat_advanced_cluster_management_for_kubernetes/2.16/html/business_continuity/index).
+- **ImportOnly strategy**: Not tested since no managed clusters were present. The `ImportOnly` behavior for uncontrolled failover scenarios is documented in [Customizing the automatic import strategy](https://docs.redhat.com/en/documentation/red_hat_advanced_cluster_management_for_kubernetes/2.16/html/clusters/cluster_mce_overview#auto-import-strategy).
+- **S3 replication lag**: The `mc mirror` approach provided near-instant replication. The behavior when the passive hub tries to restore a partially-replicated backup was not stress-tested. The `restoreSyncInterval` ≥ 2x replication lag guidance was not validated under load.
+- **Server-side S3 replication**: The test used client-side mirroring (`mc mirror`), not server-side replication (AWS CRR, MinIO distributed mode, or Noobaa MCG). The ACM behavior is identical regardless of replication method since replication is transparent to the backup operator.
+- **DR testing procedure**: The "tag resources" step (one-time Restore with `cleanupBeforeRestore: None`) from the non-destructive DR testing section was not tested.
+- **Observability failover**: Thanos compactor shutdown and `observatorium` resource preservation were not tested.
+- **Large-scale performance**: The test used minimal hub data. For hubs managing 1000+ clusters, Velero resource limits may need tuning and backup/restore times will be longer.
