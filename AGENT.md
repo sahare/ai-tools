@@ -109,6 +109,22 @@ It is compatible with any AI agent that can read project files and execute shell
 
 4. Remind the user to run `make update` in the release repo and create a PR.
 
+### Skill: Cut ACM Release Branch (Operator Repo + CI)
+
+**Triggers:** "cut release branch", "new release", "branch for 5.0", "release branching"
+
+**Steps:**
+1. Read `projects/acm-release-cut/RELEASE_BRANCHING_SKILL.md` for the full procedure
+2. Gather required info: NEW_VERSION (e.g., `5.0`), PREV_VERSION (e.g., `2.17`)
+3. The skill covers all changes across three branches (new release, main, previous release) for tekton files, plus openshift/release CI changes
+4. Follow the checklist — 12 steps total across operator repo and openshift/release
+5. Use `acm-cut-release.py` for the openshift/release steps (Steps 8-12)
+
+**Important:**
+- Timing matters — some steps depend on fast-forward being stopped
+- Always verify the post-cut state matches the expected state in the skill doc
+- Applies to both cluster-backup-operator and volsync-addon-controller
+
 ### Skill: Triage Customer Backup/Restore Issue
 
 **Triggers:** "triage this", "customer issue", "customer says", "help with this support question"
