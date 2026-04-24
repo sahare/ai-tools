@@ -1,98 +1,83 @@
 # ACM Release Branch Cut — Operator Repo Tekton & CI Changes
 
-This skill documents all the steps needed when cutting a new ACM release branch for the cluster-backup-operator (and volsync-addon-controller). It covers tekton file changes, prow configuration, and coordination with the new automated fast-forwarding system.
+This skill documents all the steps needed when cutting a new ACM release branch for operator repos (cluster-backup-operator, volsync-addon-controller, and similar). It covers tekton file changes and openshift/release CI configuration.
 
-**Last updated:** April 2026 (ACM 5.0 release process — reflects new automated branch creation and fast-forwarding)
+**Last updated:** April 25, 2026 (ACM 5.0 release — verified process)
 
-## When This Skill Is Needed
+## How the New Process Works (ACM 5.0+)
 
-When ACM cuts a new release (e.g., 2.17 → 5.0). Branch day is the day after feature freeze.
+1. A **cron job** (every 2 hours) automatically creates release branches and fast-forwards main → release branches
+2. The cron reads from `stolostron/acm-config/blob/main/product/component-registry.yaml` to determine which repos to process
+3. For **protected branches**, the cron creates PRs instead of direct pushes — these need to be reviewed/merged
+4. An **`acm-cicd-prow-bot`** creates a PR titled "Add Tekton files for versions: X.X X.X" with slim tekton files using the common pipeline
+5. **Konflux** (`red-hat-konflux[bot]`) also auto-generates PRs with full pipeline definitions — these must be **closed, not merged** (or updated to use common pipeline format)
+6. **ART transition (future):** The ART team will eventually take over Dockerfiles, tekton pipelines, and fast-forwarding
 
-## What Changed for ACM 5.0
+Source: Konflux Lunch and Learn (April 21, 2026), openshift/release PR #78109
 
-Starting with ACM 5.0, the process has changed significantly:
+## Key Principle: All Tekton Files Live on Main
 
-- **Branches are created automatically** by a new periodic cron job (every 2 hours) — teams no longer create release branches manually
-- The cron job fast-forwards from main to release-5.0 (and release-5.1)
-- **Teams are responsible for:** porting tekton files, stopping old fast-forwarding, cleaning up branches
-- **ART transition (future):** Eventually the ART (OpenShift build) team will take over Dockerfiles, tekton pipelines, and fast-forwarding entirely
-- **Do NOT merge** auto-generated Konflux PRs — they are not compatible with our common pipelines
+All tekton files for all active releases are checked into **main**. The cron job fast-forwards them to the release branches. The **CEL expression** in each file controls which branch actually triggers the build:
 
-Source: Konflux Lunch and Learn (April 21, 2026), PR https://github.com/openshift/release/pull/78109
+- **Push files** target a specific release branch: `target_branch == "release-5.0"` — only triggers when code is pushed to that branch
+- **PR files** target `main` (or `main || release-X`) — triggers on PRs to those branches
 
-## Terminology
-
-| Term | Meaning |
-|------|---------|
-| **NEW_VERSION** | The new release being cut (e.g., `5.0`) |
-| **PREV_VERSION** | The previous release (e.g., `2.17`) |
-| **Tekton push file** | Triggers Konflux build on merge to a branch |
-| **Tekton PR file** | Triggers Konflux build on pull requests |
-| **CEL expression** | `on-cel-expression` in tekton files that controls which branch triggers the pipeline |
-| **Fast-forward** | Auto-merge from main → release branch (now handled by cron job for 5.0+) |
-| **ART** | OpenShift build team that will eventually own Dockerfiles and tekton pipelines |
+This means release branches will have tekton files for OTHER versions (from fast-forward), but they won't trigger because the CEL doesn't match. It's **harmless but best practice to clean up**.
 
 ## File Naming Convention
 
-Tekton files follow this pattern:
 ```
-.tekton/cluster-backup-operator-acm-{VERSION}-push.yaml
-.tekton/cluster-backup-operator-acm-{VERSION}-pull-request.yaml
-```
-
-Version examples: `217` for 2.17, `50` for 5.0, `216` for 2.16.
-
-## Pre-Branch-Day State
-
-On **main** (fast-forwarding to both release-2.17 via Prow and release-5.0 via new cron):
-```
-.tekton/
-  cluster-backup-operator-acm-{PREV_VERSION}-push.yaml          # push targets: release-{PREV_VERSION}
-  cluster-backup-operator-acm-{PREV_VERSION}-pull-request.yaml   # PR targets: main || release-{PREV_VERSION}
-  cluster-backup-operator-acm-{NEW_VERSION}-push.yaml            # push targets: main
-  cluster-backup-operator-acm-{NEW_VERSION}-pull-request.yaml    # PR targets: main || release-{NEW_VERSION}
+.tekton/{repo-name}-acm-{VERSION}-push.yaml
+.tekton/{repo-name}-acm-{VERSION}-pull-request.yaml
 ```
 
-The **release-{PREV_VERSION}** branch is identical to main (via Prow fast-forward), including the NEW_VERSION tekton files that shouldn't be there.
+Examples: `cluster-backup-operator-acm-50`, `volsync-addon-controller-acm-51`
 
-## Branch Day Checklist (Thursday — Feature Freeze + 1)
+## Branch Day Checklist (Feature Freeze + 1)
 
-### Step 1: Verify NEW_VERSION tekton files are on main
+### Step 1: Review and fix the bot PR
 
-The NEW_VERSION tekton files should already be merged to main (created by Konflux and ported earlier). Verify:
+The `acm-cicd-prow-bot` creates a PR adding tekton files for the new versions. **Check for these common issues:**
 
+- **`ACM_VERSION` not updated** — bot copies from previous release but may leave the old version. Fix: update `ACM_VERSION=X.X` in build-args for all new files
+- **Push CEL targeting `main`** — should target the specific release branch (e.g., `release-5.0`). Fix: change `target_branch == "main"` → `target_branch == "release-X.X"` in push files
+- **Missing repo-specific params** — compare with previous release files. Some repos have extra build-args (e.g., volsync has `commitFromGit_arg={{revision}}`), different Dockerfiles, different pipeline refs (`common.yaml` vs `common-base.yaml`), or pathChanged filters in CEL
+
+**How to fix:** Fetch the bot PR branch, make changes, push back:
 ```bash
-ls .tekton/cluster-backup-operator-acm-{NEW_VERSION}-*.yaml
+git fetch upstream add-tekton-files-5.0-5.1
+git checkout -b fix-bot-pr upstream/add-tekton-files-5.0-5.1
+
+# Make fixes...
+
+git add .tekton/
+git commit -s --amend --no-edit
+git push upstream HEAD:add-tekton-files-5.0-5.1 --force-with-lease
 ```
 
-If not present, port them from the PREV_VERSION files:
-- Copy PREV_VERSION tekton files, rename to NEW_VERSION
-- Update: application name, component name, ACM_VERSION build arg, output-image, service account name
-- Push file: set `target_branch == "main"`
-- PR file: set `target_branch == "main" || target_branch == "release-{NEW_VERSION}"`
+### Step 2: Close Konflux auto-generated PRs
 
-**For ACM 5.0:** Already done via PR #1581 (cluster-backup-operator) and PR #1302 (volsync-addon-controller).
+PRs from `red-hat-konflux[bot]` contain full pipeline definitions (~550 lines each) that are **not compatible** with our common pipeline approach. Close them.
 
-### Step 2: Verify versioning is updated
+### Step 3: Verify versioning
 
-Check these files for version references:
 ```bash
 cat COMPONENT_VERSION
 grep ACM_VERSION Dockerfile.rhtap
+grep ACM_VERSION .tekton/*-push.yaml
 ```
 
-Update if needed to reflect the new version.
+### Step 4: Merge the bot PR after CI passes
 
-### Step 3: Do NOT merge auto-generated Konflux PRs
+## After Branch Day
 
-Konflux will auto-generate PRs for the new branch. **Close them without merging** — they are not compatible with our common pipelines from `stolostron/konflux-build-catalog`.
+### Step 5: Stop Prow fast-forward to previous release
 
-### Step 4: Stop Prow fast-forward to PREV_VERSION
+Your colleague or the CI team updates `openshift/release` to remove or change the fast-forward destination:
 
-On branch day or soon after, disable the Prow fast-forward from main → release-{PREV_VERSION}.
-
-In `openshift/release` repo, the main CI config has:
+File: `ci-operator/config/stolostron/{repo}/{repo}-main.yaml`
 ```yaml
+# Remove or update:
 - as: fast-forward
   postsubmit: true
   steps:
@@ -101,174 +86,127 @@ In `openshift/release` repo, the main CI config has:
     workflow: ocm-ci-fastforward
 ```
 
-Either remove this job or update it. The new cron job handles fast-forwarding to NEW_VERSION, so the Prow fast-forward is only needed for PREV_VERSION during the transition.
+### Step 6: Clean up previous release branch
 
-**Note:** Validate that the new cron job is actually running and fast-forwarding to release-{NEW_VERSION} before disabling the Prow fast-forward.
+After fast-forward to the previous release is stopped, clean up that branch. Create a PR against `release-{PREV_VERSION}`:
 
-### Step 5: Clean up release-{PREV_VERSION} branch
-
-After fast-forwarding to PREV_VERSION is stopped, remove the NEW_VERSION tekton files that were accidentally fast-forwarded:
-
+**Delete** all new version tekton files (they got there via fast-forward):
 ```bash
-git checkout release-{PREV_VERSION}
-git pull upstream release-{PREV_VERSION}
-git rm .tekton/cluster-backup-operator-acm-{NEW_VERSION}-push.yaml
-git rm .tekton/cluster-backup-operator-acm-{NEW_VERSION}-pull-request.yaml
+git fetch upstream release-{PREV_VERSION}
+git checkout -b cleanup-prev upstream/release-{PREV_VERSION}
+git rm .tekton/*-acm-{NEW_VERSION}-*
+git rm .tekton/*-acm-{NEXT_VERSION}-*
 ```
 
-Update PREV_VERSION PR file — remove `main` from CEL (since main no longer fast-forwards here):
+**Narrow** the previous version PR file CEL — remove `main`:
 ```yaml
 # BEFORE:
-pipelinesascode.tekton.dev/on-cel-expression: event == "pull_request" &&
+on-cel-expression: event == "pull_request" &&
   (target_branch == "main" || target_branch == "release-{PREV_VERSION}")
 
 # AFTER:
-pipelinesascode.tekton.dev/on-cel-expression: event == "pull_request" && target_branch == "release-{PREV_VERSION}"
+on-cel-expression: event == "pull_request" && target_branch == "release-{PREV_VERSION}"
 ```
-
-Keep PREV_VERSION push file as-is — already targets `release-{PREV_VERSION}`.
 
 ```bash
 git add .tekton/
-git commit -s -m "Clean up release-{PREV_VERSION}: remove {NEW_VERSION} tekton files, narrow PR CEL to release branch only"
-git push upstream release-{PREV_VERSION}
+git commit -s -m "Clean up release-{PREV_VERSION}: remove new version tekton files, narrow PR CEL"
+git push origin cleanup-prev
+# Create PR against upstream/release-{PREV_VERSION}
 ```
 
-### Step 6: Update tekton files on release-{NEW_VERSION} branch
+**Note:** If upstream has changed since you branched (e.g., more files were fast-forwarded), you may need to `git rebase upstream/release-{PREV_VERSION}` and resolve conflicts (just `git rm` the conflicting files).
 
-Once the new cron job has created and fast-forwarded to release-{NEW_VERSION}, update the tekton files on that branch:
+### Step 7: Clean up main
 
-**Update NEW_VERSION push file** — change target from `main` to `release-{NEW_VERSION}`:
-```yaml
-# BEFORE:
-pipelinesascode.tekton.dev/on-cel-expression: event == "push" && target_branch == "main"
+Remove previous release tekton files from main (since main no longer fast-forwards there):
 
-# AFTER:
-pipelinesascode.tekton.dev/on-cel-expression: event == "push" && target_branch == "release-{NEW_VERSION}"
-```
-
-**Update NEW_VERSION PR file** — remove `main` from CEL:
-```yaml
-# BEFORE:
-pipelinesascode.tekton.dev/on-cel-expression: event == "pull_request" &&
-  (target_branch == "main" || target_branch == "release-{NEW_VERSION}")
-
-# AFTER:
-pipelinesascode.tekton.dev/on-cel-expression: event == "pull_request" && target_branch == "release-{NEW_VERSION}"
-```
-
-**Remove PREV_VERSION tekton files** from the new branch:
-```bash
-git checkout release-{NEW_VERSION}
-git rm .tekton/cluster-backup-operator-acm-{PREV_VERSION}-push.yaml
-git rm .tekton/cluster-backup-operator-acm-{PREV_VERSION}-pull-request.yaml
-git add .tekton/
-git commit -s -m "Update tekton files for release-{NEW_VERSION} branch"
-git push upstream release-{NEW_VERSION}
-```
-
-**Important (from Tesshu):** This step must be done after the real branching and after fast-forwarding from main to release-{NEW_VERSION} is configured. Otherwise the cron job will overwrite your changes with main's version.
-
-### Step 7: Clean up main branch (after fast-forward to PREV_VERSION stops)
-
-Remove PREV_VERSION tekton files from main:
 ```bash
 git checkout main
-git rm .tekton/cluster-backup-operator-acm-{PREV_VERSION}-push.yaml
-git rm .tekton/cluster-backup-operator-acm-{PREV_VERSION}-pull-request.yaml
+git pull upstream main
+git rm .tekton/*-acm-{PREV_VERSION}-*
 git commit -s -m "Remove {PREV_VERSION} tekton files from main"
-git push upstream main
+# Create PR against upstream/main
 ```
 
-Keep NEW_VERSION files on main as-is — they're correct for ongoing development:
-- Push targets `main` (correct — cron job fast-forwards to release-{NEW_VERSION})
-- PR targets `main || release-{NEW_VERSION}` (correct)
+### Step 8: Create prow config for new release (openshift/release)
 
-### Step 8: Prow configuration for release-{NEW_VERSION} (openshift/release repo)
-
-Create prow configuration for the new branch if ready to deliver content. This includes:
-
-**CI config** (`ci-operator/config/stolostron/cluster-backup-operator/`):
-- Create `stolostron-cluster-backup-operator-release-{NEW_VERSION}.yaml`
-- Configure: build, unit-tests, sonar, crd-and-gen-files-check, image mirror
-
-**Branch protection** (`core-services/prow/02_config/stolostron/cluster-backup-operator/_prowconfig.yaml`):
-- Add `release-{NEW_VERSION}` entry with required status checks and PR review requirements
-
-**Update main CI config:**
-- Update fast-forward destination if still using Prow fast-forward
-- Update promotion version
-
-Use `acm-cut-release.py` for automation of these steps, or do manually.
+Use `acm-cut-release.py` or manually create:
+- CI config: `stolostron-{repo}-release-{NEW_VERSION}.yaml`
+- Branch protection in `_prowconfig.yaml`
+- Enable previous release promotion
+- Update main CI promotion version
 
 ```bash
-cd /path/to/openshift/release
-make update
+python3 projects/acm-release-cut/acm-cut-release.py \
+  --new-version {NEW_VERSION} \
+  --repos cluster-backup-operator volsync-addon-controller \
+  --release-repo /path/to/openshift/release \
+  --dry-run
 ```
 
-## Post-Cut State (What It Should Look Like After)
+## Expected End State
 
-### main branch
+### main
+Only current + next release tekton files:
 ```
 .tekton/
-  cluster-backup-operator-acm-{NEW_VERSION}-push.yaml          # push targets: main
-  cluster-backup-operator-acm-{NEW_VERSION}-pull-request.yaml   # PR targets: main || release-{NEW_VERSION}
+  {repo}-acm-{NEW_VERSION}-push.yaml          # push: release-{NEW_VERSION}
+  {repo}-acm-{NEW_VERSION}-pull-request.yaml   # PR: main || release-{NEW_VERSION}
+  {repo}-acm-{NEXT_VERSION}-push.yaml          # push: release-{NEXT_VERSION}
+  {repo}-acm-{NEXT_VERSION}-pull-request.yaml  # PR: main || release-{NEXT_VERSION}
 ```
 
-### release-{NEW_VERSION} branch
-```
-.tekton/
-  cluster-backup-operator-acm-{NEW_VERSION}-push.yaml          # push targets: release-{NEW_VERSION}
-  cluster-backup-operator-acm-{NEW_VERSION}-pull-request.yaml   # PR targets: release-{NEW_VERSION}
-```
+### release-{NEW_VERSION}
+Same as main (via fast-forward). Only {NEW_VERSION} files trigger (CEL match).
 
-### release-{PREV_VERSION} branch
+### release-{PREV_VERSION}
+Only previous release files:
 ```
 .tekton/
-  cluster-backup-operator-acm-{PREV_VERSION}-push.yaml          # push targets: release-{PREV_VERSION}
-  cluster-backup-operator-acm-{PREV_VERSION}-pull-request.yaml   # PR targets: release-{PREV_VERSION}
+  {repo}-acm-{PREV_VERSION}-push.yaml          # push: release-{PREV_VERSION}
+  {repo}-acm-{PREV_VERSION}-pull-request.yaml   # PR: release-{PREV_VERSION}
 ```
 
 ## Summary Checklist
 
-| # | When | Branch | Action |
-|---|------|--------|--------|
-| 1 | Branch day | main | Verify NEW_VERSION tekton files exist |
-| 2 | Branch day | main | Verify versioning updated (COMPONENT_VERSION, Dockerfile.rhtap) |
-| 3 | Branch day | — | Do NOT merge auto-generated Konflux PRs |
-| 4 | Branch day or soon after | openshift/release | Stop Prow fast-forward to PREV_VERSION |
-| 5 | After ff stops | release-{PREV_VERSION} | Remove NEW_VERSION tekton files + narrow PREV_VERSION PR CEL |
-| 6 | After ff configured | release-{NEW_VERSION} | Update NEW_VERSION push/PR CEL + remove PREV_VERSION tekton files |
-| 7 | After ff stops | main | Remove PREV_VERSION tekton files |
-| 8 | When ready | openshift/release | Create prow CI config + branch protection for release-{NEW_VERSION} |
+| # | When | Action |
+|---|------|--------|
+| 1 | Branch day | Review + fix bot PR (ACM_VERSION, push CEL, repo-specific params) |
+| 2 | Branch day | Close Konflux auto-generated PRs |
+| 3 | Branch day | Verify versioning |
+| 4 | Branch day | Merge bot PR after CI passes |
+| 5 | After branch day | Stop Prow fast-forward to previous release (openshift/release) |
+| 6 | After ffwd stops | Clean up previous release branch (delete new files, narrow CEL) |
+| 7 | After ffwd stops | Clean up main (remove previous release tekton files) |
+| 8 | When ready | Create prow config for new release (openshift/release) |
 
-## Timing Notes
+## Common Bot PR Issues (Learned from ACM 5.0)
 
-- **Step 1-3:** Do on branch day (Thursday)
-- **Step 4:** Do on branch day or very soon after — validate new cron job is working first
-- **Step 5:** Do after Prow fast-forward to PREV_VERSION is confirmed stopped
-- **Step 6:** Do after new cron job is fast-forwarding to release-{NEW_VERSION} — be careful not to do this while cron is still overwriting the branch with main content
-- **Step 7:** Do after Step 4 — otherwise PREV_VERSION files on main would be fast-forwarded back to release-{PREV_VERSION}
-- **Step 8:** Can be done in parallel once branch exists
+| Issue | Description | Fix |
+|-------|-------------|-----|
+| `ACM_VERSION` not updated | Bot copies from previous release, leaves old version | Change `ACM_VERSION=X.X` to correct version |
+| Push CEL targets `main` | Should target release branch for safety | Change to `target_branch == "release-X.X"` |
+| Missing build-args | Some repos have extra args (e.g., `commitFromGit_arg`) | Compare with previous release template |
+| Different pipeline ref | Some repos use `common-base.yaml` not `common.yaml` | Verify against previous release |
+| Different namespace | Repos may be in different Konflux tenants | Verify against previous release |
+| pathChanged filters | Some repos have complex CEL with file path filters | Bot usually handles this correctly |
 
-## Future: ART Transition
+## Multi-Component Repos
 
-The ART (OpenShift build) team will eventually take over:
-- Dockerfiles
-- Tekton pipelines
-- Fast-forwarding
-
-Once this happens, Branch Day will be significantly simpler for development teams. Timeline TBD — follow up in the ART sync calls or ACM Konflux initiative channel.
+Some repos have multiple components (e.g., `multicluster-global-hub` has agent, manager, operator). These get multiple tekton files per version (push + PR per component). The same process applies — just more files to check.
 
 ## Applies To
 
-- `stolostron/cluster-backup-operator`
-- `stolostron/volsync-addon-controller` (same pattern, different file names)
+- `stolostron/cluster-backup-operator` (1 component)
+- `stolostron/volsync-addon-controller` (1 component)
+- `stolostron/multicluster-global-hub` (3 components: agent, manager, operator)
+- Any other stolostron repo using Konflux with common pipeline
 
 ## Historical Reference
 
-| Release | Key Commits / PRs |
-|---------|------------------|
-| 2.15 → 2.16 | `e26adc44` (add 216 tekton), `fa0bba2e` (remove 215 from main/2.16), `0ade7e07` (update 215 branch) |
-| 2.16 → 2.17 | `8bb1b961` (add 217 tekton), `d79b3ebc` (narrow 216 PR to release-2.16 only) |
-| 2.17 → 5.0 | PR #1581 (add 50 tekton to main), new automated cron job for fast-forwarding |
+| Release | Key Events |
+|---------|-----------|
+| 2.15 → 2.16 | Manual process: `e26adc44`, `fa0bba2e`, `0ade7e07` |
+| 2.16 → 2.17 | Manual process: `8bb1b961`, `d79b3ebc` |
+| 2.17 → 5.0 | New automated process. Bot PRs had `ACM_VERSION` bug and push CEL targeting `main`. Fixed in PR review. Cron job creates branches automatically. Also creates 5.1 as frozen release. |
