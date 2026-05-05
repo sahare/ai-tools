@@ -416,6 +416,48 @@ oc logs -n open-cluster-management-backup -l app.kubernetes.io/name=velero --tai
 oc logs -n open-cluster-management-backup -l app=cluster-backup-chart-clusterbackup --tail=100
 ```
 
+### 16. "BareMetal / ClusterInstance clusters and DR"
+**Category:** Informational / Architecture
+**Scenario:** Customer uses ClusterInstance (siteconfig-operator) to provision BareMetal clusters and wants active/passive DR.
+
+**What gets backed up:**
+- `ClusterInstance` CRs (from `siteconfig.open-cluster-management.io` — included via `.open-cluster-management.io` suffix match)
+- `ClusterDeployment` and Hive resources (from `.hive.openshift.io`)
+- `agent-install.openshift.io` resources (InfraEnv, AgentClusterInstall, etc.) — in activation backup
+- Cluster credentials/kubeconfigs — in credentials backup
+
+**Cluster reconnection:** ClusterInstance-provisioned clusters are Hive-created (ClusterDeployment exists). They reconnect automatically after restore — no ManagedServiceAccount needed. `useManagedServiceAccount: true` is only needed for imported clusters without a Hive kubeconfig.
+
+**BareMetalHost (BMH) backup:**
+- ACM 2.16+: BMHs are backed up by default (MGMT-18971)
+- ACM < 2.16: BMHs need manual label `cluster.open-cluster-management.io/backup: cluster-activation` and `restoreStatus` configuration in the Restore CR:
+  ```yaml
+  restoreStatus:
+    includedResources:
+      - BareMetalHost
+  ```
+
+**MCE PVs (assisted-service, assisted-image-service, postgres):**
+- PVs are NOT backed up by default and are NOT needed for DR
+- When CRs (InfraEnv, AgentClusterInstall, etc.) are restored, assisted-service automatically syncs cluster data from the CRs into its postgres DB
+- Logs and events are lost, but operational data is recreated
+- This auto-sync feature is available since ACM 2.11
+- No PV backup or volume snapshot needed for the hub DR scenario
+
+**GitOps + backup coexistence:**
+- Restoring everything without excluding GitOps-managed resources is safe — larger backup footprint but no conflicts
+- Velero restores resources, then GitOps reconciles and applies its desired state — they converge
+- Minimal risk of ordering/race conditions, typically harmless
+- If you want to minimize backup scope: only cluster installation artifacts (credentials, ClusterDeployment, activation data) are essential. GitOps can recreate the rest.
+
+**Unsupported configuration:** Using a managed cluster (provisioned by the primary hub) as the passive hub is NOT officially supported.
+
+### 17. "oadp-hdr-app-install policy (community policy for managed cluster app DR)"
+**Category:** Out of scope (different from hub backup)
+**What it is:** Community policy from `open-cluster-management-io/policy-collection` that installs OADP on managed clusters for application data DR. NOT part of the cluster-backup-operator.
+**Location:** `community/CM-Configuration-Management/acm-app-pv-backup/`
+**If issues reported:** Check Velero restore status on the managed cluster. Common issue: restore references an expired backup → delete the stale Velero Restore resource.
+
 ## Information to Collect for Bug Reports
 
 When a customer issue looks like a potential bug, ask for:
