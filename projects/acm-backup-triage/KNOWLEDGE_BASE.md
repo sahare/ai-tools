@@ -125,6 +125,98 @@ Resources are backed up in two categories:
 installer.open-cluster-management.io/oadp-subscription-spec: '{"channel": "stable-1.4"}'
 ```
 
+## ImportOnly Strategy (ACM 2.14+ / MCE 2.9+)
+
+The `ImportOnly` import strategy is critical for DR scenarios. It controls whether a hub cluster automatically re-imports managed clusters that become unreachable.
+
+**With `ImportOnly` (default for new installs since MCE 2.9 / ACM 2.14):**
+- Once a managed cluster has successfully joined and `ManagedClusterImportSucceeded` is True, the hub stops applying klusterlet manifests
+- If the cluster later becomes Unknown (moved to another hub, or network issue), the hub will NOT try to re-import it
+- Manual import is required to reclaim the cluster
+
+**With `ImportAndSync` (default for upgraded hubs from pre-2.14):**
+- The hub continuously synchronizes klusterlet manifests
+- If a cluster becomes Unknown, the hub WILL try to reconnect it — causing conflicts in DR scenarios
+
+**Official docs state:** *"Use the ImportOnly strategy for a hub cluster disaster recovery scenario where you want to prevent the initial hub cluster from recovering the managed clusters, if the initial hub cluster restarts unexpectedly after the managed clusters were moved to a different hub cluster."*
+
+**Check current strategy:**
+```bash
+oc get configmap import-controller-config -n multicluster-engine -o yaml
+```
+
+**Set ImportOnly:**
+```bash
+oc -n multicluster-engine create configmap import-controller-config \
+  --from-literal=autoImportStrategy=ImportOnly
+```
+
+**Include in backups (so restored hubs also use it):**
+```bash
+oc -n multicluster-engine label configmap import-controller-config \
+  cluster.open-cluster-management.io/backup=true
+```
+
+**ALWAYS mention ImportOnly when discussing:** controlled failover, planned switchover, non-destructive DR testing, moving managed clusters, or any scenario where two hubs could compete for the same clusters.
+
+## Controlled Failover / Planned Switchover
+
+For planned maintenance, DR testing, or intentional site switches (not just disaster scenarios):
+
+**Steps:**
+1. **Ensure passive hub is synced** — Restore in `Enabled` phase with `syncRestoreWithNewBackups: true`
+2. **Pause backups on primary** — Set `spec.paused: true` on BackupSchedule (prevents backup collision)
+3. **Shut down primary hub** (or ensure ImportOnly is set if keeping it running for DR testing)
+4. **Activate on passive** — Patch Restore: `veleroManagedClustersBackupName: latest`
+5. **Delete the Restore** on the new active hub after activation completes
+6. **Create BackupSchedule** on the new active hub
+
+**For non-destructive DR testing (primary stays running):**
+- ACM 2.14+: Set `ImportOnly` strategy → primary won't reclaim clusters
+- ACM < 2.14: Add `import.open-cluster-management.io/disable-auto-import: ''` annotation to all ManagedClusters on primary
+- Pause BackupSchedule on primary before activating on secondary
+
+**Failback to original primary:**
+1. Create BackupSchedule on secondary (current active), wait for completion
+2. Pause backups on secondary
+3. Restore on original primary with `cleanupBeforeRestore: CleanupRestored`
+4. Re-enable BackupSchedule on original primary
+5. Re-enable passive sync on secondary
+
+**Docs:** Business Continuity guide, sections "Restoring activation resources", "Backup Collisions", "Restoring data to the initial hub cluster"
+
+## Argo CD / ApplicationSet DR Considerations
+
+When the hub runs Argo CD ApplicationSets (especially the ACM-Argo CD pull model), DR has additional risks due to cascade deletion chains.
+
+**What's backed up automatically (no label needed):**
+- Applications, ApplicationSets, AppProjects, ArgoCD CR — all in `argoproj.io`, which is in `includedAPIGroupsByName`
+- GitOpsCluster — in `apps.open-cluster-management.io`
+- ManagedServiceAccount — in `authentication.open-cluster-management.io`
+
+**What NEEDS the backup label:**
+- Argo CD repo credential Secrets (`argocd.argoproj.io/secret-type: repository`)
+- Argo CD cluster Secrets (`argocd.argoproj.io/secret-type: cluster`)
+- Argo CD ConfigMaps (`argocd-cm`, `argocd-rbac-cm`, `argocd-ssh-known-hosts-cm`, `argocd-tls-certs-cm`)
+- These are core `v1` resources in `openshift-gitops` namespace — need `cluster.open-cluster-management.io/backup` label
+
+**Cascade deletion risk (Chain 4 — hub temporarily unavailable):**
+```
+Hub goes down (upgrade or DR failover)
+  → Hub comes back / new hub activates
+    → Managed clusters appear unreachable during reconnection window
+      → Placement de-selects clusters (no/short toleration)
+        → ApplicationSet removes Applications for those clusters
+          → Cascade-delete of workloads (VMs, etc.) on managed clusters
+```
+
+**Protection layers (defense in depth):**
+1. `preserveResourcesOnDeletion: true` on ApplicationSets (both AppSet-level and template-level) — prevents cascade delete even if Applications are removed
+2. Placement tolerations with explicit `tolerationSeconds` (e.g., 14400 = 4 hours) — buys time during hub restart/failover reconnection window
+3. ValidatingAdmissionPolicy on critical namespaces (OCP 4.15+) — blocks all deletions in protected namespaces
+
+**Key point for DR:** `preserveResourcesOnDeletion` and Placement tolerations should be configured BEFORE disaster occurs. They are DR prerequisites, not just deletion protection.
+
 ## Common Customer Issues and Triage
 
 ### 1. "Restore stuck in Error after temporary BSL outage"
@@ -243,6 +335,8 @@ spec:
   3. When disaster strikes: edit the Restore to set `veleroManagedClustersBackupName: latest`
   4. Wait for Finished, then create BackupSchedule on the new active hub
 **Important:** Do not create a second Restore — edit the existing one. The webhook enforces a two-step workflow: create with `skip`, then update to `latest`.
+**For planned/controlled failover:** See the [Controlled Failover / Planned Switchover](#controlled-failover--planned-switchover) section above. Key additions: pause BackupSchedule first, ensure ImportOnly strategy is set (ACM 2.14+).
+**For Argo CD pull-model architectures:** See [Argo CD / ApplicationSet DR Considerations](#argo-cd--applicationset-dr-considerations). Ensure `preserveResourcesOnDeletion` and Placement tolerations are configured before disaster.
 **Blog:** https://www.redhat.com/en/blog/backup-and-restore-hub-clusters-with-red-hat-advanced-cluster-management-for-kubernetes
 **Blog:** https://www.redhat.com/en/blog/how-to-move-from-standalone-rhacm-to-an-active/passive-setup
 
@@ -267,7 +361,7 @@ See the [OADP Version Compatibility](#oadp-version-compatibility) table above.
 **Correct approach:** Use the "move managed clusters" procedure — only move activation data, not all hub content. Both hubs MUST have identical policies/apps for any placement that could match moved clusters.
 
 **Uncontrolled failover (hub1 dies without preparation):**
-- ACM 2.14+ has `ImportOnly` import strategy (default on new installs) — prevents the hub from re-importing clusters it already knows about
+- ACM 2.14+ has `ImportOnly` import strategy (default on new installs) — prevents the hub from re-importing clusters it already knows about. See [ImportOnly Strategy](#importonly-strategy-acm-214--mce-29) section.
 - For ACM < 2.14, there is no workaround for uncontrolled DR
 
 **Strong recommendation:** Full active/passive with identical hubs is the supported, well-tested path.
@@ -281,7 +375,7 @@ See the [OADP Version Compatibility](#oadp-version-compatibility) table above.
   2. On primary: prepare the hub (follow "Prepare the primary hub" steps)
   3. On new hub: create Restore to move managed clusters
   4. Cleanup on primary is optional
-**ACM 2.14+:** `ImportOnly` strategy eliminates the need for the prepare step in uncontrolled scenarios.
+**ACM 2.14+:** `ImportOnly` strategy eliminates the need for the prepare step in uncontrolled scenarios. See [ImportOnly Strategy](#importonly-strategy-acm-214--mce-29) section.
 **Blog:** https://developers.redhat.com/learn/openshift/move-managed-clusters-using-acm-212-backup-component
 
 ### 12. "Application data backup on managed clusters"
