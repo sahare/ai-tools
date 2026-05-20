@@ -748,3 +748,94 @@ kubectl annotate mch multiclusterhub --overwrite mch-imageOverridesCM=searchoper
 - `pkg/federated/federated.go` — global search fan-out
 - `pkg/federated/fedConfig.go` — federation config from ConfigMaps
 - `pkg/server/server.go` — HTTP router
+
+---
+
+## Development Checklist & Lessons Learned
+
+### CRD Type Changes (search-v2-operator)
+
+Every time you modify `api/v1alpha1/*.go` and run `make generate; make manifests; make bundle`,
+**three CRD files** must be in sync. Two are auto-generated, one is hand-maintained:
+
+| File | How it's updated | Common mistake |
+|------|-----------------|----------------|
+| `config/crd/bases/search.open-cluster-management.io_collectorconfigs.yaml` | Auto — `make manifests` | ✅ Always updated |
+| `bundle/manifests/search.open-cluster-management.io_collectorconfigs.yaml` | Auto — `make bundle` | ✅ Always updated |
+| `addon/manifests/chart/templates/collectorconfig_crd.yaml` | **Manual** — hand-maintained Helm chart | ❌ Often forgotten |
+
+**Rule:** After running `make manifests`, always run:
+```bash
+git diff config/crd/bases/search.open-cluster-management.io_collectorconfigs.yaml
+```
+Then manually mirror ANY new fields, descriptions, or x-kubernetes markers into
+`addon/manifests/chart/templates/collectorconfig_crd.yaml`. The two files must match exactly.
+
+**Why it matters:** The addon chart CRD is deployed to **managed clusters** via the Helm add-on.
+If it drifts from the hub CRD, managed clusters get different API semantics (e.g. missing
+`x-kubernetes-list-map-keys` means atomic list replacement instead of merge-by-type, which
+can cause duplicate condition entries).
+
+### Makefile tooling (search-v2-operator)
+
+The Makefile pins `controller-gen@v0.11.3` but the CRD files in the repo were generated with
+`v0.18.0` (visible in the `controller-gen.kubebuilder.io/version` CRD annotation). Running
+`make manifests` with the pinned v0.11.3 will crash on Go 1.24+.
+
+**Workaround:** Install v0.18.0 separately and copy it into `bin/` before running make:
+```bash
+go install sigs.k8s.io/controller-tools/cmd/controller-gen@v0.18.0
+cp $(go env GOPATH)/bin/controller-gen bin/controller-gen
+make generate
+make manifests
+```
+The `go-get-tool` macro only downloads if `bin/controller-gen` doesn't exist, so the pre-installed
+binary takes precedence. Do **not** change the Makefile — the rest of the team uses it as-is.
+
+Similarly, `make bundle` requires operator-sdk but `go.kubebuilder.io/v3` (in the PROJECT file)
+was dropped in operator-sdk v1.31+. Use `--plugins go.kubebuilder.io/v4` to bypass:
+```bash
+./bin/kustomize build config/manifests | \
+  operator-sdk generate bundle -q --overwrite --version 0.0.1 \
+  --plugins go.kubebuilder.io/v4
+# Then revert noise: bundle.Dockerfile, annotations.yaml, clusterserviceversion.yaml
+git checkout bundle.Dockerfile bundle/metadata/annotations.yaml \
+  bundle/manifests/search-v2-operator.clusterserviceversion.yaml
+```
+
+### RBAC for new status subresources (search-v2-operator)
+
+When adding a new `status` subresource to a CRD, you need `patch`/`update` permissions
+in **three places**:
+
+1. **`controllers/create_rolesbindings.go`** `getRules()` — hub `search` ClusterRole (runtime)
+2. **`controllers/search_controller.go`** `//+kubebuilder:rbac` marker — generates `config/rbac/role.yaml`
+3. **`addon/manifests/chart/templates/cluster_role.yaml`** — managed cluster collector ClusterRole
+
+Missing #3 is the most common oversight because it's a separate Helm chart, not part of the
+standard kubebuilder RBAC generation flow.
+
+### Warning truncation in status conditions (search-collector)
+
+The `updateCollectorConfigStatus` function truncates warnings at `maxStatusWarnings = 3`.
+If you increase the limit or change the truncation format, update:
+1. `configurableCollection.go` — the `maxStatusWarnings` constant and the truncation logic
+2. `genericResourceConfig_test.go` — `TestStatusCondition_WarningTruncation` subtests
+
+The truncation test uses **6 genuinely distinct rule types** (not the same rule with different
+targets) so that presence/absence of each warning in the message can be independently asserted.
+If you add a new warning path, add a new entry to `distinctWarningRules` in the test.
+
+### Kubebuilder list markers on Conditions fields
+
+Always add `+listType=map` and `+listMapKey=type` to any `[]metav1.Condition` field:
+```go
+// +listType=map
+// +listMapKey=type
+Conditions []metav1.Condition `json:"conditions,omitempty"`
+```
+Without these, the API server uses atomic list semantics (full replacement on update),
+which can cause duplicate condition types. These markers are enforced in:
+- `config/crd/bases/` (via `make manifests`)
+- `bundle/manifests/` (via `make bundle`)
+- `addon/manifests/chart/templates/collectorconfig_crd.yaml` (**manual** — easy to forget)
