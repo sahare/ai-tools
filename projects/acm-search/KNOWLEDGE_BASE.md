@@ -847,8 +847,21 @@ rule. Note: you only need `collectorconfigs/status` with `patch`/`update` — th
 `collectorconfigs` get/list/watch is already covered by the wildcard rule at the top of the file.
 
 **Real incident:** ACM build `5.0.0-73` was blocked in Installing status because PR #726
-(search-v2-operator) added the RBAC to places 1-3 but missed places 4-5. Fixed in
-multiclusterhub-operator PR #4192.
+(search-v2-operator) added the RBAC to places 1-3 but missed places 4 and 5-6.
+
+#### The correct fix process (automation-first)
+
+**DO NOT manually edit MCH templates.** The MCH team has a GitHub Action that automatically
+syncs `search-v2-operator` bundle changes into `multiclusterhub-operator`.
+
+Correct workflow:
+1. Fix the source in **search-v2-operator** — specifically the CSV `clusterPermissions` (#4 above)
+2. The MCH GitHub Action (`create-pull-request`) automatically creates a sync PR in `multiclusterhub-operator`
+3. MCH team reviews and merges their automated sync PR
+
+If you manually edit `multiclusterhub-operator` templates (as in PR #4192), those changes
+will be overwritten or conflict with the automated sync PR (#4196). Close the manual PR
+and let automation handle it.
 
 ### Warning truncation in status conditions (search-collector)
 
