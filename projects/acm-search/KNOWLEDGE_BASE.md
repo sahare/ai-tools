@@ -814,11 +814,12 @@ incident (MCH stuck in Installing status).
 1. **`controllers/create_rolesbindings.go`** `getRules()` — hub `search` ClusterRole (runtime Go code)
 2. **`controllers/search_controller.go`** `//+kubebuilder:rbac` marker — generates `config/rbac/role.yaml`
 3. **`addon/manifests/chart/templates/cluster_role.yaml`** — managed cluster collector ClusterRole (Helm)
+4. **`bundle/manifests/search-v2-operator.clusterserviceversion.yaml`** `clusterPermissions` — OLM CSV; MCH automation builds off this file and will strip permissions not listed here
 
 #### Repo 2: stolostron/multiclusterhub-operator ⚠️ MOST COMMONLY FORGOTTEN
 
-4. **`pkg/templates/charts/toggle/search-v2-operator/templates/search-v2-operator-clusterrole.yaml`** — MCH Helm template that controls what permissions the search-v2-operator's OWN service account has
-5. **`pkg/templates/rbac_gen.go`** — kubebuilder marker in MCH that generates the above
+5. **`pkg/templates/charts/toggle/search-v2-operator/templates/search-v2-operator-clusterrole.yaml`** — MCH Helm template that controls what permissions the search-v2-operator's OWN service account has
+6. **`pkg/templates/rbac_gen.go`** — kubebuilder marker in MCH that generates the above
 
 #### Why the MCH repo matters (Kubernetes privilege escalation protection)
 
