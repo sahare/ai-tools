@@ -803,17 +803,51 @@ git checkout bundle.Dockerfile bundle/metadata/annotations.yaml \
   bundle/manifests/search-v2-operator.clusterserviceversion.yaml
 ```
 
-### RBAC for new status subresources (search-v2-operator)
+### RBAC for new status subresources (search-v2-operator) ⚠️ PRODUCTION LESSON
 
 When adding a new `status` subresource to a CRD, you need `patch`/`update` permissions
-in **three places**:
+in **FIVE places** across **TWO repos**. Missing any one of them causes a real production
+incident (MCH stuck in Installing status).
 
-1. **`controllers/create_rolesbindings.go`** `getRules()` — hub `search` ClusterRole (runtime)
+#### Repo 1: stolostron/search-v2-operator
+
+1. **`controllers/create_rolesbindings.go`** `getRules()` — hub `search` ClusterRole (runtime Go code)
 2. **`controllers/search_controller.go`** `//+kubebuilder:rbac` marker — generates `config/rbac/role.yaml`
-3. **`addon/manifests/chart/templates/cluster_role.yaml`** — managed cluster collector ClusterRole
+3. **`addon/manifests/chart/templates/cluster_role.yaml`** — managed cluster collector ClusterRole (Helm)
 
-Missing #3 is the most common oversight because it's a separate Helm chart, not part of the
-standard kubebuilder RBAC generation flow.
+#### Repo 2: stolostron/multiclusterhub-operator ⚠️ MOST COMMONLY FORGOTTEN
+
+4. **`pkg/templates/charts/toggle/search-v2-operator/templates/search-v2-operator-clusterrole.yaml`** — MCH Helm template that controls what permissions the search-v2-operator's OWN service account has
+5. **`pkg/templates/rbac_gen.go`** — kubebuilder marker in MCH that generates the above
+
+#### Why the MCH repo matters (Kubernetes privilege escalation protection)
+
+Kubernetes RBAC enforces: **you cannot grant permissions you don't already have.**
+
+In a real ACM install, MCH creates and manages the search-v2-operator service account's
+ClusterRole. If MCH's ClusterRole for search-v2-operator doesn't include
+`collectorconfigs/status`, then the search-v2-operator can't add that permission to the
+`search` ClusterRole it manages — even though that's exactly what our Go code tries to do.
+
+The error you'll see:
+```
+ClusterRole setup failed: clusterroles.rbac.authorization.k8s.io "search" is forbidden:
+user "system:serviceaccount:open-cluster-management:search-v2-operator" is attempting to
+grant RBAC permissions not currently held:
+{APIGroups:["search.open-cluster-management.io"], Resources:["collectorconfigs/status"],
+Verbs:["patch" "update"]}
+```
+This causes the search-v2-operator reconcile loop to fail → MCH stuck in `Installing` status.
+
+#### What to add in multiclusterhub-operator
+
+In `search-v2-operator-clusterrole.yaml` AND `rbac_gen.go`, add the `collectorconfigs/status`
+rule. Note: you only need `collectorconfigs/status` with `patch`/`update` — the base
+`collectorconfigs` get/list/watch is already covered by the wildcard rule at the top of the file.
+
+**Real incident:** ACM build `5.0.0-73` was blocked in Installing status because PR #726
+(search-v2-operator) added the RBAC to places 1-3 but missed places 4-5. Fixed in
+multiclusterhub-operator PR #4192.
 
 ### Warning truncation in status conditions (search-collector)
 
