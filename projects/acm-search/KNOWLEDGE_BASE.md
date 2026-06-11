@@ -874,6 +874,62 @@ The truncation test uses **6 genuinely distinct rule types** (not the same rule 
 targets) so that presence/absence of each warning in the message can be independently asserted.
 If you add a new warning path, add a new entry to `distinctWarningRules` in the test.
 
+---
+
+## ACM Backup/Restore and CollectorConfig (ACM-20052)
+
+### Why search resources are excluded from automatic backup
+
+`cluster-backup-operator/controllers/backup.go` has an `excludedAPIGroups` list that includes
+`search.open-cluster-management.io`. The comment explains why:
+
+> `search.open-cluster-management.io` is required to be backed up, but since the CRs are created
+> in the MCH NS which is excluded by the resources backup, we want those CRs to be labeled with
+> `cluster.open-cluster-management.io/backup` so they are picked up by the resources-generic backup.
+
+In other words: the API group is excluded globally, but individual resources that should survive
+backup get the label `cluster.open-cluster-management.io/backup: ""` and are picked up by the
+`acm-resources-generic-schedule` (generic backup).
+
+### The three CollectorConfig types on the hub
+
+The search-v2-operator manages three kinds of CollectorConfig in `open-cluster-management` namespace:
+
+| Name | Created by | Needs backup? |
+|---|---|---|
+| `user-collector-config` | End user | ✅ YES — user's search customization |
+| `<team>-config` (labeled with `search.open-cluster-management.io/config-type: integration`) | Integration teams (e.g. CNV, Kueue) | ✅ YES |
+| `merged-collector-config` | search-v2-operator (computed merge) | ❌ NO — recreated on every reconcile |
+
+### The fix (ACM-20052 hub scope)
+
+The search-v2-operator's reconcile loop calls `ensureCollectorConfigsBackupLabel` which:
+1. Lists all CollectorConfigs in the operator namespace
+2. Skips `merged-collector-config` (operator-managed)
+3. Adds `cluster.open-cluster-management.io/backup: ""` to any config missing the label
+
+Constant defined in `api/v1alpha1/collectorconfig_types.go`:
+```go
+const BackupLabel = "cluster.open-cluster-management.io/backup"
+```
+
+### Spoke-side CollectorConfig (future work, NOT ACM-20052)
+
+CollectorConfig also exists on managed (spoke) clusters — the search-collector on each spoke
+reads it from its local namespace. ACM backup only backs up hub resources, so spoke-side
+configs are NOT covered by ACM-20052.
+
+The proposed future solution: distribute CollectorConfig from hub to spokes via ManifestWork
+(the operator already uses this pattern for global search in `controllers/global_search_setup.go`).
+If a Policy is used instead, the policy is hub-side and IS backed up; policy enforcement
+re-creates the spoke config after hub restore. The interval gap (time between last backup and
+failure) means the most recent changes may be lost, but that is a general limitation of any
+interval-based backup — not a bug specific to this approach.
+
+Jorge's concern about resync pressure: when spokes receive a restored CollectorConfig, each
+search-collector restarts and re-indexes all resources → load spike on search-indexer/postgres.
+At scale (hundreds of clusters), this warrants a staggered rollout or rate limiting.
+
 ### Kubebuilder list markers on Conditions fields
 
 Always add `+listType=map` and `+listMapKey=type` to any `[]metav1.Condition` field:
