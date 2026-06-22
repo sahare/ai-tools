@@ -943,3 +943,137 @@ which can cause duplicate condition types. These markers are enforced in:
 - `config/crd/bases/` (via `make manifests`)
 - `bundle/manifests/` (via `make bundle`)
 - `addon/manifests/chart/templates/collectorconfig_crd.yaml` (**manual** — easy to forget)
+
+---
+
+## Exclude Action in CollectorConfig (ACM-35522)
+
+### Architecture overview
+
+Exclude is implemented in two layers:
+
+**Layer 1 — Operator webhook** (`search-v2-operator/api/v1alpha1/collectorconfig_webhook.go`):
+- `validateExcludeRule()` rejects exclude rules that specify `fields`, `collectConditions`,
+  `collectAnnotations`, or `fieldSuffix` (meaningless on an exclude)
+- Rejects exclusion of `ManagedCluster` (`cluster.open-cluster-management.io`) and `Namespace`
+  (core group) — the search RBAC engine uses them for cluster-scoped and namespace-scoped
+  access control. `ManagedClusterSet`/`ManagedClusterSetBinding` are NOT protected because the
+  RBAC engine does not query them directly.
+- Wildcard kind `*` is allowed even for protected groups — the collector handles it at runtime
+- Wildcard+fields and fieldSuffix format checks are include-only (guarded by `rule.Action == ActionInclude`)
+  to avoid duplicate validation errors for exclude rules
+
+**Layer 2 — Operator merge** (`search-v2-operator/controllers/create_collectorconfig.go`):
+- `excludeOverlapsIntegrationIncludes()` uses `setsIntersect()` (wildcard-aware) to detect
+  overlap between user exclude rules and integration team include rules
+- User exclude rules that overlap integration team includes are dropped from `merged-collector-config`
+- When rules are dropped, `updateUserCCStatus()` writes `Applied=False / RulesSkipped` on
+  `user-collector-config` so users can discover why their rule had no effect
+
+**Layer 3 — Collector enforcement** (`search-collector/pkg/transforms/configurableCollection.go`):
+- `excludedResources map[string]struct{}` — package-level deny set, reset on every config load
+- Key scheme mirrors `mergedTransformConfig`: `"Lease.coordination.k8s.io"`, `"*.apps"`,
+  `"Lease.*"` (all groups for this kind), `"*.*"` (global)
+- `mergeExcludeRules()` / `unmergeExcludeRules()` — "last entry wins": only **valid** include
+  rules (with fields/collectConditions/collectAnnotations) can cancel a prior exclude; a
+  skipped/malformed include does NOT cancel an exclude (bug found and fixed in review)
+- `IsResourceExcluded(group, kind)` — 4-level lookup: exact → kind wildcard → group wildcard → global
+
+**Enforcement point** (`search-collector/pkg/informer/informer.go`):
+- `IsResourceExcluded()` checked at ALL THREE event entry points (list sync, ADDED, MODIFIED)
+  right alongside the namespace filter — stops excluded resources before the transformer
+
+### Known design behaviors (not bugs)
+
+**Stale records after adding an exclude:** When an exclude rule is first applied, previously
+indexed resources of that type remain in the search DB. Since the collector no longer watches
+excluded resource types at the informer level, delete events are also missed — stale records
+persist until naturally cleaned up. Exclude only affects new indexing cycles going forward.
+
+**Exclude does not cascade to integration team fields:** If an integration team includes
+`Deployment.apps` (to add a custom field) and the user's exclude for `Deployment.apps` is
+dropped by merge protection, the user sees `Applied=False / RulesSkipped` on their config.
+
+### Bugs found during implementation and review
+
+1. **`unmergeExcludeRules` before actionable-content guard** — The original code called
+   `unmergeExcludeRules` for ALL non-exclude rules, including invalid ones that get skipped
+   with a warning. A malformed include (no fields/conditions) would silently cancel a prior
+   exclude. Fixed by moving `unmergeExcludeRules` to AFTER the `!hasFields && !hasCollectConditions
+   && !hasCollectAnnotations` guard. Regression test: `TestExclude_InvalidIncludeDoesNotCancelExclude`.
+
+2. **`IsResourceExcluded` check #3 skipped for core-group** — The original `"Kind.*"` check
+   (`if group != "" { ... }`) skipped the check when group was empty, meaning `apiGroups:["*"]`
+   did not exclude core-group resources. Fixed by removing the `group != ""` guard.
+
+3. **`collectAnnotations` missing from `validateExcludeRule`** — Original implementation
+   checked `fields`, `collectConditions`, `fieldSuffix` but missed `collectAnnotations`.
+   Found during live E2E testing. Fixed in commit `212342e`.
+
+### Testing patterns
+
+**How to test the exclude feature on a live cluster:**
+
+The key challenge: the search-v2-operator reconcile loop continuously reverts custom
+collector images to the production build. The reliable pattern is:
+
+```bash
+# 1. Keep MCH paused (prevents MCH from reverting operator/collector)
+oc annotate mch multiclusterhub -n open-cluster-management \
+  'installer.open-cluster-management.io/pause'=true --overwrite
+
+# 2. Keep search-pause=true when not merging configs
+oc annotate search search-v2-operator -n open-cluster-management \
+  search-pause=true --overwrite
+
+# 3. Deploy custom images via oc set image (not oc patch --type=json)
+oc set image deployment/search-collector \
+  search-collector=quay.io/<user>/search-collector:<tag> \
+  -n open-cluster-management
+oc set env deployment/search-collector \
+  FEATURE_CONFIGURABLE_COLLECTION=true -n open-cluster-management
+# Add pull secret separately
+oc patch deployment search-collector -n open-cluster-management \
+  --type=json -p '[{"op":"add","path":"/spec/template/spec/imagePullSecrets",
+  "value":[{"name":"quay-pull-secret"}]}]'
+
+# 4. When you need to update merged-collector-config (create user config, let operator merge):
+#    a. Create user-collector-config (goes through webhook normally)
+#    b. Briefly unpause search: oc annotate search ... search-pause- --overwrite
+#    c. Wait ~12s for merge
+#    d. Immediately re-pause: oc annotate search ... search-pause=true --overwrite
+#    e. Re-apply custom image (reconcile may have reverted it during step b/c)
+```
+
+**Why imageOverride doesn't work reliably:**
+The search operator has a known bug where `createOrUpdateDeployment` constructs fresh
+Deployment objects without copying `resourceVersion`, so `r.Update()` fails silently.
+`imageOverride` in the Search CR does not propagate. The workaround is to pause the
+operator and patch the deployment directly (Option B from the E2E testing guide).
+
+**Verifying exclude works (DB-based test):**
+```bash
+DB_POD=$(oc get pod -n open-cluster-management | grep postgres | awk '{print $1}')
+# Before: clear existing records of the excluded kind
+oc exec -n open-cluster-management $DB_POD -- \
+  psql -U searchuser search -c \
+  "DELETE FROM search.resources WHERE data->>'kind'='Lease';"
+# Wait one full resync cycle (~70-80s)
+sleep 80
+# After: should be 0 if exclude is working
+oc exec -n open-cluster-management $DB_POD -- \
+  psql -U searchuser search -c \
+  "SELECT count(*) FROM search.resources WHERE data->>'kind'='Lease';"
+```
+
+### Related files
+
+| File | Purpose |
+|---|---|
+| `search-v2-operator/api/v1alpha1/collectorconfig_webhook.go` | Webhook validation for exclude rules |
+| `search-v2-operator/api/v1alpha1/collectorconfig_webhook_test.go` | 11 webhook tests |
+| `search-v2-operator/controllers/create_collectorconfig.go` | Merge protection + status condition |
+| `search-v2-operator/controllers/create_collectorconfig_test.go` | 6 merge protection tests + status test |
+| `search-collector/pkg/transforms/configurableCollection.go` | excludedResources, IsResourceExcluded |
+| `search-collector/pkg/informer/informer.go` | Informer-layer gate |
+| `search-collector/pkg/transforms/configurableCollection_test.go` | 11 exclude tests + behavior tests |
