@@ -1,4 +1,83 @@
-# Installing ACM Dev Builds from quay.io/acm-d
+# Installing ACM — Concepts and All Install Types
+
+## Key Concepts
+
+### OLM (Operator Lifecycle Manager)
+
+OLM is OpenShift's built-in app-store system for operators. Instead of manually applying dozens of YAML files (CRDs, RBAC, Deployments, webhooks), OLM automates the entire operator install lifecycle.
+
+**How it works:**
+1. You create a `CatalogSource` pointing to a catalog image
+2. OLM reads the catalog to discover available operators and their versions
+3. You create a `Subscription` to install a specific operator from that catalog
+4. OLM downloads images, applies CRDs, sets up RBAC, and starts the operator pod automatically
+5. You create the operand (e.g. `MultiClusterHub`) and the operator does the rest
+
+### Catalog Image
+
+A catalog image is a container image that acts as the "app store inventory" — it lists:
+- Which operators are available
+- What versions exist
+- Where their component images live
+- What CRDs, RBAC, and webhooks they need
+
+The `acm-dev-catalog:latest-5.0` image is rebuilt frequently (multiple times/day) by Red Hat's build pipeline. Each rebuild pulls in the latest operator images and manifests. If a PR hasn't been merged and a new catalog hasn't been built yet, `latest-5.0` won't include that change.
+
+---
+
+## Three Install Types
+
+### 1. Downstream Dev Build (what we use for development testing)
+
+**Registry:** `quay.io:443/acm-d`
+**Catalog images:** `acm-dev-catalog:latest-5.0`, `mce-dev-catalog:latest-5.0`
+**Access:** Requires `quay.io:443` credentials (get CLI password from quay.io → Account Settings → Generate Encrypted Password)
+**Use when:** Daily development and feature testing — this gives you the latest unreleased build
+
+This is what the `install-acm.sh` script in this repo installs.
+
+### 2. Downstream Release (what customers use)
+
+**Registry:** `registry.redhat.io/rhacm2`
+**Catalog:** `redhat-operator-index` (the official Red Hat operator catalog, pre-installed on OCP)
+**Access:** Red Hat subscription (available via `pull-secret.txt` from `console.redhat.com`)
+**Use when:** Testing against an officially released version (e.g. ACM 2.12.0), reproducing customer issues
+
+```bash
+# Install released ACM via standard Red Hat catalog (no custom CatalogSource needed)
+oc create namespace open-cluster-management
+cat <<EOF | oc apply -f -
+apiVersion: operators.coreos.com/v1alpha1
+kind: Subscription
+metadata:
+  name: advanced-cluster-management
+  namespace: open-cluster-management
+spec:
+  channel: release-5.0        # or release-2.12, release-2.13, etc.
+  installPlanApproval: Automatic
+  name: advanced-cluster-management
+  source: redhat-operators     # pre-installed on OCP
+  sourceNamespace: openshift-marketplace
+EOF
+```
+
+### 3. Upstream Community Build
+
+**Registry:** `quay.io/stolostron`
+**Catalog:** Community operator catalog or deploy directly via `stolostron/deploy` repo
+**Access:** Public
+**Use when:** Open-source community testing without Red Hat credentials
+
+The upstream tool is the `stolostron/deploy` repo which has snapshot-based installs:
+```bash
+# Example: deploy a specific snapshot
+export SNAPSHOT=2.12.0-SNAPSHOT-2024-01-15-00-00-00
+./start.sh --watch
+```
+
+---
+
+## Downstream Dev — Detailed Install (Manual Steps)
 
 This document describes how to install ACM (Advanced Cluster Management) development builds from the internal `quay.io:443/acm-d` registry on an OpenShift cluster.
 
@@ -344,6 +423,27 @@ oc delete namespace open-cluster-management
 # Delete catalogsources (optional)
 oc delete catalogsource acm-dev-catalog mce-dev-catalog -n openshift-marketplace
 ```
+
+## Known Issues with Fresh Dev Installs
+
+### Search webhook caBundle not injected (MCH stuck in Installing)
+
+On a fresh ACM 5.0 dev install, the search-v2-operator webhook's `caBundle` is not automatically populated. The search reconciler tries to create `merged-collector-config` but the webhook call fails with `x509: certificate signed by unknown authority`, causing the Search reconciler to crash-loop and MCH to stay in `Installing`.
+
+**Fix** (apply immediately after install while MCH is still installing):
+```bash
+CA_BUNDLE=$(oc get secret webhook-server-cert -n open-cluster-management \
+  -o jsonpath='{.data.tls\.crt}')
+oc patch validatingwebhookconfiguration search-v2-operator-validating-webhook-configuration \
+  --type=json \
+  -p "[{\"op\":\"replace\",\"path\":\"/webhooks/0/clientConfig/caBundle\",\"value\":\"$CA_BUNDLE\"}]"
+```
+
+This is a known gap — the OpenShift service-ca controller should inject the caBundle automatically via the `service.beta.openshift.io/inject-cabundle: "true"` annotation on the ValidatingWebhookConfiguration. PR #739 (`add inject-cabundle annotation`) addresses this permanently.
+
+### CatalogSource timeout in install script
+
+The `install-acm.sh` script has a 180-second timeout for the CatalogSource to become `READY`. On slow clusters or networks, this may fail even though the catalog is still initializing. **Fix:** re-run the script with `--skip-pull-secret` — the CatalogSource will likely be ready by then.
 
 ## Notes
 
