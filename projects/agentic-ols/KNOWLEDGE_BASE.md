@@ -448,6 +448,123 @@ Reference the existing backup triage knowledge at `ai-tools/projects/acm-backup-
 
 ---
 
+---
+
+## Production-Quality LLM Setup (Beyond Hackathon)
+
+The agentic-ols operator uses the **OpenAI Responses API** (`POST /v1/responses`),
+which expects structured JSON output with strict schema enforcement. Small local models
+(granite3.3:8b, 8B params) produce the right ideas but randomly drop required fields.
+This makes output fail the AnalysisResult CRD validation. Here's how to get reliable output:
+
+### Option 1 — Red Hat OpenShift AI MaaS (RECOMMENDED — no personal API key)
+
+Red Hat runs **Models-as-a-Service (MaaS)** internally via OpenShift AI. It serves
+IBM Granite models (same family as local Ollama but bigger/better) via an
+OpenAI-compatible API. It uses your OCP bearer token — no personal account needed.
+
+**How to get access:** Ask your team lead or Red Hat IT for the internal RHOAI/MaaS endpoint.
+
+```bash
+# Use your OCP token as the API key
+TOKEN=$(oc whoami -t)
+oc create secret generic rhoai-credentials \
+  --from-literal=OPENAI_API_KEY=$TOKEN \
+  -n openshift-lightspeed
+
+cat <<EOF | oc apply -f -
+apiVersion: agentic.openshift.io/v1alpha1
+kind: LLMProvider
+metadata:
+  name: rhoai-granite
+  namespace: openshift-lightspeed
+spec:
+  type: OpenAI
+  openAI:
+    url: https://maas.CLUSTER_DOMAIN/llm/ibm-granite-3b-gpu/v1
+    credentialsSecret:
+      name: rhoai-credentials
+EOF
+```
+
+No ngrok needed — the MaaS endpoint is already on the corporate network.
+
+### Option 2 — Shared OpenAI API key (most reliable, best schema compliance)
+
+The project was built and tested against GPT-4. With a shared project key (not personal):
+```bash
+oc create secret generic llm-creds-openai \
+  --from-literal=OPENAI_API_KEY=sk-TEAM-KEY \
+  -n openshift-lightspeed
+```
+
+Cost: ~$0.01/run with gpt-4o-mini. Ask your team lead for a shared project key.
+
+### Option 3 — Vertex AI / Claude (in quickstart, first-class support)
+
+If your team has a GCP service account, Claude-3.5-Sonnet via Vertex gives GPT-4 level
+quality. The quickstart has a ready-to-use YAML for this.
+
+### Option 4 — Deploy Ollama on cluster with 70B model (no ngrok, no cloud)
+
+```bash
+# Deploy Ollama as a pod on the cluster
+cat <<EOF | oc apply -f -
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: ollama
+  namespace: openshift-lightspeed
+spec:
+  replicas: 1
+  selector:
+    matchLabels: {app: ollama}
+  template:
+    metadata:
+      labels: {app: ollama}
+    spec:
+      containers:
+      - name: ollama
+        image: ollama/ollama:latest
+        env:
+        - name: OLLAMA_HOST
+          value: "0.0.0.0"
+        ports:
+        - containerPort: 11434
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: ollama
+  namespace: openshift-lightspeed
+spec:
+  selector: {app: ollama}
+  ports:
+  - port: 11434
+EOF
+
+# Pull a bigger model (70B gives much better schema compliance, needs ~40GB)
+oc exec -it deploy/ollama -n openshift-lightspeed -- ollama pull llama3:70b
+```
+
+Then LLMProvider URL = `http://ollama.openshift-lightspeed.svc:11434/v1` — no ngrok.
+
+### LLM comparison for structured output compliance
+
+| LLM | Schema compliance | Cost | Setup complexity |
+|---|---|---|---|
+| GPT-4 / GPT-4o | ⭐⭐⭐⭐⭐ Excellent | ~$0.01/run | Easy (one API key) |
+| Claude 3.5 Sonnet | ⭐⭐⭐⭐⭐ Excellent | ~$0.01/run | Need Vertex or Anthropic key |
+| RHOAI MaaS Granite (3B+) | ⭐⭐⭐⭐ Good | Free internal | Need RHOAI access |
+| llama3:70b (local/cluster) | ⭐⭐⭐⭐ Good | Free | Needs 40GB RAM |
+| granite3.3:8b (local) | ⭐⭐ Poor | Free | Easy but unreliable |
+| mistral:7b (local) | ⭐⭐ Poor | Free | Easy but unreliable |
+
+**Bottom line:** For mergeable, production-usable skills → use RHOAI MaaS or a shared
+OpenAI key. For hackathons/demos where schema failures are acceptable → local Ollama is fine.
+
+---
+
 ## Quick Reference
 
 ```bash
