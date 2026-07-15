@@ -81,6 +81,35 @@ PRIMARY KEY(sourceId, destId, edgeType)
 - Add/Update events → transformer input channel
 - Delete events → directly to reconciler input (no transform needed)
 
+### Dynamic CollectorConfig Reload (ACM-20047, pkg/transforms/collectorConfigReload.go)
+
+Before this landed (PR #908, merged to `search-collector` main), `LoadAndMergeConfigurableCollection()`
+was only called once, at collector process startup (`main.go`) — any CollectorConfig change required a
+full collector pod restart to take effect. **This is no longer true.** As of ACM-20047:
+
+- The collector's informer set (`pkg/informer/runInformers.go`) runs a real Kubernetes informer directly
+  on the `CollectorConfig` GVR itself (`CollectorConfigGVR`). Its `OnAdd`/`OnUpdate`/`OnDelete` handlers
+  invoke a `ConfigReloadHandler`, which calls `tr.ReloadAndDiff(dynamicClient)`.
+- `ReloadAndDiff` (in `collectorConfigReload.go`) snapshots the current `mergedTransformConfig` and
+  `excludeRules` (under `mergedTransformConfigMu.RLock()`), calls
+  `loadAndMergeConfigurableCollectionWithClient()` to reload from the cluster (atomic swap under
+  `.Lock()`), then diffs old vs new:
+  - `AffectedResources` — config keys (`"Pod"`, `"Deployment.apps"`, etc.) whose transform properties
+    changed → triggers a **targeted re-list** of just those resource types.
+  - `ExcludeRulesChanged` — true if the exclude/include rule list changed → triggers a **full
+    `syncInformers` pass** to start/stop informers as needed (since excluding a resource means no
+    informer should exist for it at all, not just filtered events).
+- If nothing changed, `ReloadAndDiff` returns `nil` and no relist happens — cheap to fire on every watch
+  event.
+- Practical effect: apply/edit a `CollectorConfig` and the change propagates within roughly a watch-event
+  round trip (Spencer's own test-plan notes budget ~1 minute as a safe margin) — **no collector pod
+  restart needed.** This applies to both `user-collector-config` and integration-labeled CollectorConfigs.
+
+**Gotcha:** `configurableCollection.go` still has a leftover stale comment
+(`// FUTURE: ACM-20047 watch this for changes and update config dynamically`) even though the mechanism
+now lives in `collectorConfigReload.go`. Don't trust that comment — it's dead documentation, not a sign
+the feature is still pending. Worth a small cleanup PR at some point.
+
 ### Transformer (pkg/transforms/transformer.go)
 - N goroutines (one per CPU core), reads from shared input channel
 - Dispatches on `[kind, apiGroup]` — 30+ typed builders
@@ -959,7 +988,16 @@ Exclude is implemented in two layers:
   (core group) — the search RBAC engine uses them for cluster-scoped and namespace-scoped
   access control. `ManagedClusterSet`/`ManagedClusterSetBinding` are NOT protected because the
   RBAC engine does not query them directly.
-- Wildcard kind `*` is allowed even for protected groups — the collector handles it at runtime
+- **Wildcard bypass fix (Jun 25 2026):** `kinds:["*"]` on a protected apiGroup is now rejected.
+  e.g. `apiGroups:["cluster.open-cluster-management.io"] kinds:["*"]` would exclude ManagedCluster
+  just as effectively as naming it. Global wildcard (`kinds:["*"] apiGroups:["*"]`) is also rejected.
+- **Integration config overlap check at admission (Jun 25 2026):** `webhookClient` (injected via
+  `SetupWebhookWithManager`) lists CollectorConfigs labeled
+  `search.open-cluster-management.io/config-type: integration`. If a user's exclude conflicts with
+  any integration team include, the webhook rejects it immediately at `kubectl apply` time.
+  This replaces the idea of a static `protectedKinds` list of Argo/Kyverno/Policy/CNV resources —
+  protection grows automatically as integration teams ship their labeled CollectorConfigs.
+  Check is skipped when `webhookClient` is nil (unit tests) or no integration configs exist.
 - Wildcard+fields and fieldSuffix format checks are include-only (guarded by `rule.Action == ActionInclude`)
   to avoid duplicate validation errors for exclude rules
 
@@ -971,13 +1009,17 @@ Exclude is implemented in two layers:
   `user-collector-config` so users can discover why their rule had no effect
 
 **Layer 3 — Collector enforcement** (`search-collector/pkg/transforms/configurableCollection.go`):
-- `excludedResources map[string]struct{}` — package-level deny set, reset on every config load
-- Key scheme mirrors `mergedTransformConfig`: `"Lease.coordination.k8s.io"`, `"*.apps"`,
-  `"Lease.*"` (all groups for this kind), `"*.*"` (global)
-- `mergeExcludeRules()` / `unmergeExcludeRules()` — "last entry wins": only **valid** include
-  rules (with fields/collectConditions/collectAnnotations) can cancel a prior exclude; a
-  skipped/malformed include does NOT cancel an exclude (bug found and fixed in review)
-- `IsResourceExcluded(group, kind)` — 4-level lookup: exact → kind wildcard → group wildcard → global
+- `excludeRules []excludeRule` — ordered slice, reset on every config load. Each entry is
+  `{apiGroups []string, kinds []string, action ActionType}` (replaces the old compound-key map).
+- Uses the same cartesian matching logic as `isResourceMatchingList` in `supportedResources.go`
+  (the Allow/Deny feature): `(g == "*" || g == group) && (k == "*" || k == kind)`.
+- `appendExcludeRule()` — adds both exclude AND valid include rules to the list. Include rules
+  append an `ActionInclude` entry that overrides prior excludes.
+- `IsResourceExcluded(group, kind)` — walks the ordered list; **last matching rule wins**.
+  An `ActionInclude` entry cancels any prior `ActionExclude` for the same resource.
+- **Wildcard-vs-specific resolved (Jun 25 2026):** `exclude "*.*"` + `include "Deployment.apps"`
+  → Deployments ARE collected, all other resources excluded. Previously this was a documented
+  limitation because the old map couldn't resolve overlapping keys.
 
 **Enforcement point** (`search-collector/pkg/informer/informer.go`):
 - `IsResourceExcluded()` checked at ALL THREE event entry points (list sync, ADDED, MODIFIED)
@@ -994,13 +1036,45 @@ persist until naturally cleaned up. Exclude only affects new indexing cycles goi
 `Deployment.apps` (to add a custom field) and the user's exclude for `Deployment.apps` is
 dropped by merge protection, the user sees `Applied=False / RulesSkipped` on their config.
 
+### Design decisions and PR review outcomes (Jun 25 2026)
+
+**Why ordered slice instead of compound-key map:**
+jlpadilla pointed out that the compound-key map (`"Lease.coordination.k8s.io"`) could not resolve
+wildcard-vs-specific conflicts. He asked us to align with the existing Allow/Deny feature's matching
+logic (`isResourceMatchingList` in `supportedResources.go`). The ordered slice with last-match-wins
+naturally handles `exclude "*.*"` + `include "Deployment.apps"` — the include entry appears later
+in the list and wins when evaluating Deployments.
+
+**Why dynamic integration config check in webhook instead of expanding `protectedKinds`:**
+smcavey noted the `protectedKinds` list (ManagedCluster, Namespace) was too short — many more
+resources are hard-coded in the collector transforms (Argo, Kyverno, Policy, CNV, etc.). jlpadilla
+suggested using "integration configs" (CollectorConfigs with `search.open-cluster-management.io/config-type: integration` label) instead of a static list. This is self-service and scalable: integration teams
+ship their own labeled CollectorConfigs, and the webhook automatically rejects user excludes that
+conflict. No static list to maintain.
+
+**Allow/Deny vs CollectorConfig exclude — key differences:**
+
+| Feature | Allow/Deny (ConfigMap) | CollectorConfig exclude |
+|---|---|---|
+| Identifier | Plural resource name (`deployments`) | Kind (`Deployment`) |
+| Enforcement point | Informer creation (startup) | Discovery time (`SupportedResources`) |
+| Semantics | Deny always wins | Last matching rule wins |
+| Wildcard | `*` per axis | `*` per axis (same logic) |
+| Dynamic reload | Yes (on CRD sync) | **Yes** — since ACM-20047 (PR #908, merged), see below |
+
+**Injecting k8s client into webhook validator:**
+The webhook validator is the `*CollectorConfig` struct. A package-level `webhookClient client.Client`
+is set in `SetupWebhookWithManager(mgr)` via `webhookClient = mgr.GetClient()`. In unit tests,
+`webhookClient` is nil and the integration config check is skipped. The client serves from an
+in-memory cache (controller-runtime cache), not live API calls.
+
 ### Bugs found during implementation and review
 
 1. **`unmergeExcludeRules` before actionable-content guard** — The original code called
    `unmergeExcludeRules` for ALL non-exclude rules, including invalid ones that get skipped
    with a warning. A malformed include (no fields/conditions) would silently cancel a prior
-   exclude. Fixed by moving `unmergeExcludeRules` to AFTER the `!hasFields && !hasCollectConditions
-   && !hasCollectAnnotations` guard. Regression test: `TestExclude_InvalidIncludeDoesNotCancelExclude`.
+   exclude. Fixed by moving the call to AFTER the actionability guard.
+   Regression test: `TestExclude_InvalidIncludeDoesNotCancelExclude`.
 
 2. **`IsResourceExcluded` check #3 skipped for core-group** — The original `"Kind.*"` check
    (`if group != "" { ... }`) skipped the check when group was empty, meaning `apiGroups:["*"]`
@@ -1008,7 +1082,11 @@ dropped by merge protection, the user sees `Applied=False / RulesSkipped` on the
 
 3. **`collectAnnotations` missing from `validateExcludeRule`** — Original implementation
    checked `fields`, `collectConditions`, `fieldSuffix` but missed `collectAnnotations`.
-   Found during live E2E testing. Fixed in commit `212342e`.
+   Found during live E2E testing.
+
+4. **Wildcard bypass in `protectedKinds` check** — `kinds:["*"]` on a protected apiGroup
+   slipped through the webhook undetected. Fixed by `validateWildcardKindAgainstProtected`
+   helper extracted from `validateExcludeRule` (also fixed Sonar nesting depth violation).
 
 ### Testing patterns
 
@@ -1077,3 +1155,103 @@ oc exec -n open-cluster-management $DB_POD -- \
 | `search-collector/pkg/transforms/configurableCollection.go` | excludedResources, IsResourceExcluded |
 | `search-collector/pkg/informer/informer.go` | Informer-layer gate |
 | `search-collector/pkg/transforms/configurableCollection_test.go` | 11 exclude tests + behavior tests |
+
+---
+
+## Future Opportunities — Search Team Priorities (Spencer McAvey, Jul 2026)
+
+Internal priorities doc from Spencer, not an official public roadmap. Captures known
+technical gaps/opportunities across three time horizons. Recorded here so the reasoning
+and tradeoffs aren't lost. See `README.md` for the plain-language version of each item.
+
+### Near term — testability
+
+**1. UI E2E tests are fragile**
+- Problem: Cypress UI tests fail often, are expensive to maintain, and a new OCP console
+  version routinely breaks selectors/behavior they depend on.
+- No proposed solution recorded yet — flagged as a known pain point.
+
+**2. API E2E tests aren't run often enough**
+- Problem: from an API developer's perspective, the Jest API suite (`search-e2e-test/tests/api/`)
+  isn't executed as frequently as it should be during day-to-day API development — so
+  regressions surface later than they could.
+
+**3. E2E tests are environment-sensitive**
+- Problem: whether UI or API, the same test suite can pass when triggered from Jenkins
+  against a QE-provisioned cluster but fail in Prow CI (or vice versa). Root cause is
+  environmental differences between how Prow spins up clusters vs. how QE does.
+
+**4. No way to scale-test the Collector itself**
+- Problem: Search's payload scale testing today starts at the **Indexer** — you can feed
+  the Indexer a specific number of synthetic resources/cluster and measure how that
+  propagates through Postgres → API → Console. But there is no way to generate synthetic
+  Kubernetes watch events (ADD/UPDATE/DELETE) for the **Collector's** resource informers
+  (see "Informer" in the search-collector deep dive above) to consume. This is called out
+  as the **last bottleneck** to knowing real end-to-end throughput and hardware sizing.
+- Proposed solution: a testing framework that mocks production of Kubernetes
+  Create/Update/Delete events that the Collector's informers listen to, so the Collector's
+  own processing/transform/send pipeline can be scale-tested in isolation, not just
+  everything downstream of it.
+
+### Medium term — scalability
+
+**5. Collector resyncs still send the full payload**
+- Problem: Every full resync currently sends the Collector's *entire* cluster state again
+  (already optimized somewhat, but still one large payload). See "Sender" in the
+  search-collector deep dive.
+- Proposed solution: batch full-cluster resyncs into smaller chunks to reduce the size of
+  any single payload.
+- Tradeoff: batching gets *some* data into the system sooner (smaller first batch arrives
+  faster), but the time to reach a *fully* synced state may take longer overall since it's
+  spread across more round trips.
+
+**6. Streaming/websocket notifications go through every layer**
+- Problem: today's streaming path is Collector → Indexer → Postgres → API → websocket
+  (see PostgreSQL LISTEN/NOTIFY in the search-v2-api deep dive above). For integration teams
+  or users wanting near-real-time updates, each hop adds latency; current end-to-end latency
+  and how it behaves at scale is unmeasured/unknown.
+- Proposed solution: let latency-sensitive integrations/users register their streaming
+  filters closer to the source — push filter registration from Collector directly to
+  API/websocket, removing some of the hops in between.
+- Tradeoff: pushes more work onto the Collector, which is already under the most pressure
+  during full-cluster syncs (per item 5 above) — optimizing one path could regress the other.
+
+### Long term — "guess what users want"-ility
+
+**7. Search has no historical/change-over-time view ("Big Search")**
+- Problem: Search only ever stores the *latest* state of each resource — both integration
+  teams and interactive users can only query "what exists right now" across the fleet.
+  Historical *metrics* exist (Prometheus), historical *logs*/audit trails exist
+  (Elasticsearch), but nothing answers "what changed, across which clusters, and when" at
+  Search's multi-cluster relational scope.
+- Proposed solution: a "Big Search" data warehouse that stores not just current state, but
+  everything that existed before it and the changes that triggered each state transition.
+  Use cases: multi-cluster incident management/timeline reconstruction, AI training data,
+  auditing.
+- Tradeoff: "Big" is right there in the name — this is a large storage-growth commitment.
+  Possible mitigation: configurable history retention length, and rebuilding history from
+  small per-record key-value change logs (deltas) rather than storing full snapshots, to
+  keep storage bounded.
+- Challenge: **historical RBAC** — a user's access to a resource today doesn't necessarily
+  tell you what they were allowed to see a month ago (roles/bindings change over time too),
+  so enforcing RBAC on *historical* query results is a genuinely hard, unsolved problem here.
+
+**8. No intelligent correlation across the change stream ("Change correlation AI")**
+- Problem: Search is uniquely positioned — it's already watching essentially everything,
+  across every managed cluster, in real time. Today that stream of changes is just
+  collected and stored; nothing analyzes it as it flows through.
+- Proposed solution: if that stream of changes could be processed intelligently (pattern
+  detection across resources/clusters), Search could raise incident flags *earlier* than
+  other monitoring/metrics tools that only look at one signal type or one cluster at a time.
+
+**9. Search Event Bus — push instead of pull**
+- Problem: today, consuming Search's real-time change stream requires holding open a
+  continuous websocket connection and handling reconnects on timeout/error — that's on the
+  consumer to build and maintain (pull model).
+- Proposed solution: Search emits its event stream to a webhook of your choosing — Slack,
+  or anywhere else — without the consumer needing to maintain a live connection, and without
+  missing events across a disconnect (push model, event log semantics rather than
+  connection semantics).
+- Challenge: **RBAC** — a webhook endpoint doesn't carry a logged-in user's identity/permissions
+  the way an authenticated websocket session does, so deciding what a given webhook
+  subscription is allowed to receive needs its own design.

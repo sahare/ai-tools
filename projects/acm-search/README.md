@@ -186,6 +186,80 @@ Plus one `klusterlet-addon-search` pod on **every managed cluster**.
 
 ---
 
+## What's Next for Search — Future Opportunities (Plain-Language)
+
+These come from an internal priorities note Spencer put together (Jul 2026) — think of it
+as "things we know we should tackle eventually," not an official commitment. Grouped by how
+soon they'd realistically happen. Full technical detail (tradeoffs, challenges) is in
+`KNOWLEDGE_BASE.md` under the same heading.
+
+### Near term — making our tests trustworthy
+
+1. **UI tests break too easily.** Every time OpenShift ships a new console version, our
+   Cypress UI tests tend to break even though Search itself didn't change. **Current
+   state:** high maintenance burden, low trust in "red" results. **Future benefit:** more
+   reliable tests mean we catch *real* regressions instead of chasing false alarms — faster,
+   safer releases for everyone using Search.
+
+2. **API tests don't run often enough.** **Current state:** as an API developer, you don't
+   get fast feedback from the full test suite while you work. **Future benefit:** catching
+   API-breaking bugs before they ship, instead of after.
+
+3. **Tests behave differently depending on where they run** (our CI vs. QE's own clusters).
+   **Current state:** a test can pass in one environment and fail in another for reasons
+   that have nothing to do with the actual bug. **Future benefit:** one trustworthy signal,
+   regardless of where the test ran.
+
+4. **We can't scale-test the Collector itself.** **Current state:** we can simulate a huge
+   number of resources arriving at the Indexer and see how Postgres/API/Console handle it —
+   but we have no way to simulate a huge *cluster* worth of live Kubernetes changes hitting
+   the Collector. That's literally the only piece of Search's scale story we can't measure
+   today. **Future benefit:** once we can, we'll finally know the true throughput limits and
+   hardware sizing needed to support very large clusters/fleets — today that's a guess.
+
+### Medium term — handling bigger clusters and faster updates
+
+5. **Full resyncs send everything at once.** **Current state:** when the Collector does a
+   full resync, it sends the whole cluster's data in one go. **Future benefit:** breaking
+   that into smaller batches means the system starts showing *some* fresh data sooner —
+   useful for very large clusters — though the *complete* refresh might take a bit longer
+   overall since it's spread out.
+
+6. **Real-time updates travel through every layer.** **Current state:** a change on a
+   managed cluster has to travel Collector → Indexer → Database → API → your browser/websocket
+   before you see it — we don't actually know how much delay that adds today. **Future
+   benefit:** for teams/users who want near-instant updates (e.g. dashboards, automation
+   reacting to cluster changes), shortening that path would make Search noticeably snappier.
+
+### Long term — features we don't have today, but users might really want
+
+7. **Search only knows "now," never "before."** **Current state:** if a resource changes,
+   the old value is just gone — Search can't tell you what something looked like yesterday,
+   or when a specific field changed, across your whole fleet. Other tools track history for
+   metrics (Prometheus) or logs (Elasticsearch), but nobody tracks history for "the state of
+   my Kubernetes objects across all clusters." **Future benefit:** imagine being able to ask
+   "what changed on this cluster between 2pm and 3pm" during an incident, across every
+   managed cluster — that's investigation time cut from hours to minutes. Genuinely hard
+   part: figuring out storage size and who's allowed to see historical data (permissions
+   change over time too).
+
+8. **We watch everything, but don't "think" about it.** **Current state:** Search collects
+   changes from every cluster continuously but just stores them — nothing looks for patterns
+   across that stream. **Future benefit:** since Search already sees more than any single
+   monitoring tool (it spans every cluster and every resource type), it's in a unique
+   position to notice trouble brewing *before* a dedicated alert fires elsewhere — an early
+   warning system built on data we already have.
+
+9. **Getting live updates requires babysitting a connection.** **Current state:** to get
+   real-time changes today, a consumer has to keep a websocket open and handle reconnects
+   themselves, or risk missing events. **Future benefit:** instead, Search could just push
+   events to a webhook you choose (Slack, your own service, anywhere) — simpler for
+   integrators, and no missed events if your connection drops. Still needs a real answer for
+   who's allowed to subscribe to what (permissions), since a webhook doesn't carry a logged-in
+   user's identity the way a browser session does.
+
+---
+
 ## Key Concepts Glossary
 
 | Term | Meaning |
