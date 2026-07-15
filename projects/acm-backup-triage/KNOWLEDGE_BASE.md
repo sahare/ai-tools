@@ -14,6 +14,13 @@ It does **NOT** handle:
 **GitHub:** https://github.com/stolostron/cluster-backup-operator
 **Official docs:** https://docs.redhat.com/en/documentation/red_hat_advanced_cluster_management_for_kubernetes/2.16/html/business_continuity/index
 
+## CRITICAL RULES (never violate these)
+
+1. **NEVER recommend deleting ManagedClusters from any hub before or during a restore operation.** The restore handles state reconciliation. Deleting ManagedClusters while they are `Available` destroys workloads on managed clusters. The `disable-auto-import` annotation (or `ImportOnly` strategy) on the old hub prevents split-brain WITHOUT deleting anything. This is basic ACM knowledge.
+2. **When reviewing customer DR playbooks**, always compare each step against the official documented procedure. Flag ANY deviation, especially deletions or detachments that aren't in the docs.
+3. **Only delete ManagedClusters from the old hub if:** (a) restore is fully complete on the new hub, (b) clusters show `Unknown` on the old hub (meaning they've moved), and (c) you don't plan to failback to that hub.
+4. **The docs explicitly say:** "If you want to restore the data to the backup after your recovery test completes, skip cleaning the resources."
+
 ## Ownership Boundaries
 
 | Component | Team | Slack Channel |
@@ -177,11 +184,22 @@ For planned maintenance, DR testing, or intentional site switches (not just disa
 - Pause BackupSchedule on primary before activating on secondary
 
 **Failback to original primary:**
-1. Create BackupSchedule on secondary (current active), wait for completion
-2. Pause backups on secondary
-3. Restore on original primary with `cleanupBeforeRestore: CleanupRestored`
-4. Re-enable BackupSchedule on original primary
-5. Re-enable passive sync on secondary
+1. On secondary (current active): Set `ImportOnly` strategy or add `disable-auto-import` annotation to all ManagedClusters
+2. Create BackupSchedule on secondary, wait for at least one successful backup
+3. Pause backups on secondary
+4. Restore on original primary with `cleanupBeforeRestore: CleanupRestored`
+5. **Important:** For imported (non-Hive) clusters, MSA auto-import will likely fail because the token was invalidated when spokes connected to the secondary during failover. Manual reimport with fresh spoke credentials is required (see issue #5 below).
+6. Re-enable BackupSchedule on original primary
+7. Re-enable passive sync on secondary
+
+**CRITICAL — DO NOT delete ManagedClusters from any hub before or during restore:**
+- **NEVER delete ManagedClusters from the source/DR hub before restoring on the target hub.** The restore process handles state reconciliation — deletion is not needed and causes damage.
+- Deleting a ManagedCluster while status is `Available` triggers cleanup on the spoke (removes addons, ManifestWorks, apps). For Hive clusters, it also triggers deprovisioning (infrastructure destruction).
+- The docs explicitly state: "If you want to restore the data to the backup after your recovery test completes, **skip cleaning the resources**" (section 1.1.8.3).
+- Cleanup is ONLY appropriate AFTER restore is complete AND clusters have successfully moved to the new hub AND their status shows `Unknown` on the old hub.
+- Even then, cleanup is optional — not required for the restore to work.
+- If ArgoCD manages ManagedCluster CRs, deleting them will fail anyway (ArgoCD recreates them via sync), causing split-brain.
+- **When reviewing customer playbooks:** ALWAYS flag any step that deletes ManagedClusters before restore. This is a dangerous anti-pattern.
 
 **Docs:** Business Continuity guide, sections "Restoring activation resources", "Backup Collisions", "Restoring data to the initial hub cluster"
 
@@ -278,6 +296,18 @@ After deletion, the controller will create new Velero restores on the next sync 
   - Check `status.messages` on the Restore for per-cluster import details
   - Non-OCP imported clusters (e.g., EKS) need `managedClusterClientConfigs.url` set on the ManagedCluster resource for auto-import to work
   - If MSA token expired before restore, auto-import fails for that cluster (check Restore status messages)
+  - **Failback scenario (round-trip failover/failback):** MSA auto-import will ALWAYS fail on failback for imported clusters. When the spoke connected to the passive hub during failover, the passive hub recreated the `auto-import-account` ServiceAccount on the spoke (new UID). The token in the backup references the old SA UID — Kubernetes rejects it with "Unauthorized" even though the JWT hasn't expired. This is a known limitation.
+    - **Fix:** Manual reimport with fresh credentials (kubeconfig or token from the spoke)
+    - **Diagnostic:** `oc --server=<spoke-url> --token=<token-from-auto-import-secret> --insecure-skip-tls-verify get secret bootstrap-hub-kubeconfig -n open-cluster-management-agent` — if unauthorized, the SA was invalidated
+    - **Prevention:** Before failback, validate the token from the backup is still valid on the spoke. If not, create a fresh backup on the passive hub after MSA token refresh.
+    - **Note:** This only affects imported clusters. Hive-created clusters use ClusterDeployment admin kubeconfig and don't rely on MSA tokens.
+  - **Work-agent timing race (ACM-34619):** Not Hive-specific but more likely with Hive clusters. The work-agent on the spoke reconciles ManifestWorks every ~4 minutes. If it fires shortly after the bootstrap secret is updated by the restore hub (while still connected to the old hub with valid certs), it fetches ManifestWorks from the old hub — which contain a bootstrap secret pointing back to the old hub. The work-agent detects "drift" and overwrites the bootstrap secret back to the old hub URL. Registration-agent then connects to the old hub instead of the restore hub. Failure rate: ~5-6%.
+    - **Symptoms:** Cluster shows `Unknown` on restore hub, may show `Available` on backup hub despite `disable-auto-import` annotation
+    - **Root cause:** Work-agent periodic reconcile (4 min interval) overwrites bootstrap secret before registration-agent restarts
+    - **Fixed in:** PR #1109 in `managedcluster-import-controller` — when `disable-auto-import` annotation is set, ManifestWorks are marked ReadOnly so work-agent cannot overwrite resources. Ships in ACM 2.17+.
+    - **Workaround (pre-fix versions):** Shut down ACM on the backup hub before restoring on the new hub, or if cluster reconnects to wrong hub, delete ManagedCluster on the wrong hub (ensure status is `Unknown` first) then re-run restore
+  - **Import controller skip logic (ACM-31624):** For imported clusters, if `ManagedClusterImportSucceeded` condition is `True` on the restored ManagedCluster, the import controller skips auto-import when using `ImportOnly` strategy. But the cluster is actually pointing to the old hub. The auto-import-secret (created by our post-restore logic) is not checked before the skip decision. Fix: PRs in `stolostron/managedcluster-import-controller` (#1107, #1108) — check for `backupRestore`-labeled auto-import-secret BEFORE the importSucceeded skip logic.
+    - **Note on timing:** Our backup operator creates the `auto-import-secret` in `postRestoreActivation`, which runs ONLY after all Velero restores reach `Finished` phase. The import controller starts processing restored ManagedClusters immediately. This gap is expected — the import controller re-reconciles and picks up the secret on subsequent loops.
 **Docs:** https://docs.redhat.com/en/documentation/red_hat_advanced_cluster_management_for_kubernetes/2.16/html/business_continuity/index
 **Blog:** https://developers.redhat.com/learn/openshift/move-managed-clusters-using-acm-212-backup-component
 
@@ -551,6 +581,51 @@ oc logs -n open-cluster-management-backup -l app=cluster-backup-chart-clusterbac
 **What it is:** Community policy from `open-cluster-management-io/policy-collection` that installs OADP on managed clusters for application data DR. NOT part of the cluster-backup-operator.
 **Location:** `community/CM-Configuration-Management/acm-app-pv-backup/`
 **If issues reported:** Check Velero restore status on the managed cluster. Common issue: restore references an expired backup → delete the stale Velero Restore resource.
+
+### 18. "ArgoCD managing ManagedCluster CRs causes split-brain during DR cleanup"
+**Category:** Design pattern / operational
+**Symptoms:** After failover, customer tries to delete/detach ManagedClusters from the source hub, but ArgoCD immediately recreates them (sync policy detects drift). Both hubs end up claiming the same clusters.
+**Root cause:** ArgoCD Application managing ManagedCluster CRs via Helm chart with `hubAcceptsClient: true` hardcoded. ArgoCD sync prevents any manual deletion.
+**Solutions:**
+  - **Option A (GitOps native):** Parameterize `hubAcceptsClient` in the Helm chart. During failover, update Git values to `hubAcceptsClient: false` and let ArgoCD sync the change.
+  - **Option B (Playbook):** Pause ArgoCD sync before cleanup: `argocd app set cluster-<name> --sync-policy none`, then delete ManagedCluster.
+  - ArgoCD sync must be paused on the source hub BEFORE any cluster deletion/detach operations.
+**Related:** This is separate from the backup-restore operator — it's an ArgoCD/GitOps design pattern issue that intersects with DR.
+**Case reference:** #04440443 (Amadeus)
+
+### 19. "Hive ClusterDeployments stuck in Deleting state after DR — stale cloud credentials"
+**Category:** Operational / Hive
+**Symptoms:** After failover/failback, deleting ClusterDeployments on the old hub causes them to hang in `Deleting` state. Hive controller logs show cloud authentication errors (e.g., `AADSTS7000215: Invalid client secret`).
+**Root cause:** Hive attempts to deprovision cloud infrastructure when ClusterDeployment is deleted. If cloud credentials (Azure SP, GCP OAuth, AWS keys) stored in the backup are stale/rotated, Hive can't authenticate and the `hive.openshift.io/deprovision` finalizer never gets removed.
+**Key insight — failover vs failback asymmetry:**
+  - **Failover:** Does NOT trigger Hive deprovisioning (clusters are moved via restore, not deleted). Stale credentials don't matter during failover.
+  - **Failback/cleanup:** Triggers Hive deprovisioning when you DELETE ClusterDeployments. Stale credentials cause failures.
+**Prevention:**
+  - Always set `spec.preserveOnDelete: true` on ALL ClusterDeployments BEFORE any deletion. This skips deprovisioning entirely.
+  - Validate cloud credentials on both hubs before DR operations.
+  - Correct playbook order: patch `preserveOnDelete=true` FIRST, then delete ManagedCluster/ClusterDeployment.
+**Recovery (if already stuck):**
+  - If `preserveOnDelete` was the intended state, manually remove the finalizer:
+    ```
+    oc patch clusterdeployment <name> -n <namespace> --type merge -p '{"metadata":{"finalizers":null}}'
+    ```
+**Pre-flight check:**
+  ```
+  oc get clusterdeployment -A -o json | jq -r '.items[] | select(.spec.preserveOnDelete != true) | "\(.metadata.namespace)/\(.metadata.name)"'
+  ```
+  If any returned, STOP and patch before proceeding with DR.
+**Case reference:** #04440443 (Amadeus)
+
+### 20. "DR at scale — guidance for large fleets (70-137 clusters)"
+**Category:** Scaling / operational
+**Key considerations for large environments:**
+  - **Race condition (ACM-34619):** At 5-6% failure rate, expect 4-8 affected clusters per 70-cluster fleet. Mitigation: shut down source hub before restore, or automate the manual reconcile trigger as a recovery step.
+  - **ArgoCD sync:** Must be paused on BOTH hubs before cleanup. Automate this in the playbook.
+  - **Credential validation:** Automate pre-flight credential checks at scale.
+  - **preserveOnDelete:** Enforce via governance policy (always-on, not just during DR).
+  - **Backup duration:** With 137 clusters, backup cycle takes longer. Ensure cron schedule allows completion.
+  - **Go/No-Go criteria before DR:** All ClusterDeployments have preserveOnDelete=true, credentials validated, ArgoCD sync pause automated, manual recovery steps documented.
+**Case reference:** #04440443 (Amadeus)
 
 ## Information to Collect for Bug Reports
 
