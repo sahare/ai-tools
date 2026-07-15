@@ -1,6 +1,6 @@
 # agentic-ols Knowledge Base
 
-Everything learned through deep-dive and live testing (Jun 22 2026).
+Everything learned through deep-dive and live testing (Jun 2026).
 Use this as the reference for adding new ACM component skills.
 
 **Repo:** https://github.com/stolostron/agentic-ols
@@ -51,7 +51,7 @@ AnalysisResult CR in openshift-lightspeed namespace
 
 | CRD | Purpose |
 |---|---|
-| `LLMProvider` | Configures which LLM backend to use (OpenAI, Ollama, Vertex, Bedrock) |
+| `LLMProvider` | Configures which LLM backend to use (OpenAI, Vertex, Bedrock) |
 | `Agent` | References an LLMProvider + model name |
 | `Proposal` | The "question" you submit — references a skills image + request text |
 | `AnalysisResult` | The agent's structured answer written back to the cluster |
@@ -69,137 +69,36 @@ For ACM Search, only `search-indexer-impact` has working scripts today.
 
 ---
 
-## What Ollama Is
+## LLM Setup — Vertex AI / Claude (Recommended)
 
-**Ollama** is a tool that runs AI language models locally on your computer.
-Instead of sending data to OpenAI's servers, the model runs on your Mac.
+The team uses **Google Cloud Vertex AI with Claude** via a shared GCP project.
+This is the standard setup — production quality, no personal cost, no networking hacks needed.
 
-- Model file (`granite3.3:8b` = ~5GB) lives on your disk
-- Ollama loads it into your GPU/CPU RAM
-- Exposes an OpenAI-compatible HTTP API on port 11434
-- The agentic operator calls `http://your-ip:11434/v1` like it calls OpenAI
+### GCP Project Details
 
-**Why use it:** free, private, no internet dependency, no per-token cost.
+- **Project:** `itpc-gcp-hcm-pe-eng-claude`
+- **Region:** `us-east5`
+- **Model:** `claude-sonnet-4@20250514` (Vertex uses `@date` versioning; Vertex auto-selects latest if omitted)
+- **Admin:** Ask jbanerje for access — he manages service accounts in this project
 
-**Limitation:** smaller local models (8B params) may not follow complex JSON schemas
-reliably. GPT-4 or Claude follow structured outputs much more precisely.
+Service accounts follow the pattern:
+`ls-<name>@itpc-gcp-hcm-pe-eng-claude.iam.gserviceaccount.com`
 
-### Ollama setup for agentic-ols
-
-```bash
-# Install
-brew install ollama
-
-# Start with external access (so cluster pods can reach it)
-# CRITICAL: OLLAMA_ORIGINS=* is needed to allow cross-origin requests from the cluster
-OLLAMA_HOST=0.0.0.0 OLLAMA_ORIGINS=* ollama serve &
-
-# Verify it's accessible externally
-curl http://$(ipconfig getifaddr en0):11434/v1/models
-
-# List available models
-ollama list
-```
-
-**Recommended models for agentic-ols:**
-
-| Model | Size | Quality | Notes |
-|---|---|---|---|
-| `granite3.3:8b` | 5GB | Medium | IBM's enterprise model, good for infra reasoning. May miss schema fields. |
-| `llama3:8b` | 5GB | Medium | Good general reasoning |
-| `mistral:7b` | 4GB | Medium | Fast, decent structured output |
-| `llama3:70b` | 40GB | High | Much better schema compliance, needs more RAM |
-| GPT-4 (cloud) | — | Best | Most reliable structured output, requires OpenAI API key |
-| Claude 3.5 (cloud) | — | Best | Also excellent, requires Anthropic key |
-
-**Known issue with granite3.3:8b:** It often misses the `proposal.estimatedImpact`
-field in the AnalysisResult schema. The skill's SKILL.md output format section must
-explicitly mention this field with an example for it to reliably include it.
-
-### Ollama alternatives
-
-| Tool | What it is | Use when |
-|---|---|---|
-| **Ollama** (recommended) | Easy local model runner | Hackathons, dev testing |
-| **LM Studio** | GUI for running models locally | If you prefer a UI |
-| **llama.cpp server** | Bare-metal local inference | Maximum performance control |
-| **OpenAI API** | Cloud, paid, most reliable | Production, when schema compliance matters |
-| **AWS Bedrock** | Cloud, IAM-auth, enterprise | If already on AWS |
-| **Red Hat RHAI** | Internal Red Hat AI service | Work projects (no personal API key needed) |
-
----
-
-## What ngrok Is
-
-**ngrok** is a tool that creates a secure tunnel from the public internet to a port
-on your local machine.
-
-The cluster runs in AWS. Your Mac is on your home network. They can't communicate.
-ngrok gives your Ollama a public URL that the cluster can reach:
-
-```
-Cluster (AWS) → https://abc123.ngrok-free.app → ngrok tunnel → your Mac:11434 → Ollama
-```
-
-**Nothing special about your data** — ngrok just forwards encrypted bytes. The actual
-AI inference still happens on your Mac.
-
-### ngrok setup
+### Step 1: Get a service account key
 
 ```bash
-# Install
-brew install ngrok/ngrok/ngrok
-
-# Sign up (free, just email) at dashboard.ngrok.com
-ngrok config add-authtoken <your-token>
-
-# Start tunnel to Ollama
-ngrok http 11434
+# Ask jbanerje to create one for you, or if you have access:
+gcloud iam service-accounts keys create /tmp/vertex-sa-key.json \
+  --iam-account=ls-<yourname>@itpc-gcp-hcm-pe-eng-claude.iam.gserviceaccount.com \
+  --project=itpc-gcp-hcm-pe-eng-claude
 ```
 
-ngrok prints: `Forwarding https://abc123.ngrok-free.app -> http://localhost:11434`
-Use that URL as the `openAI.url` in your LLMProvider CR.
-
-### ngrok alternatives
-
-| Tool | What it is | Notes |
-|---|---|---|
-| **ngrok** (recommended) | Tunnel service | Free tier, fast setup |
-| **cloudflared** | Cloudflare Tunnel | Free, no account limit |
-| **tailscale** | VPN mesh | More permanent solution, integrates with corp VPN |
-| **Deploy Ollama on cluster** | Kubernetes pod | Most permanent, requires GPU node or lots of CPU |
-| **Cloud LLM** | OpenAI/Bedrock/RHAI | Eliminates the networking problem entirely |
-
----
-
-## Full Setup Guide (Fresh Cluster)
-
-### Prerequisites checklist
-
-- [ ] OpenShift cluster (OCP 4.21+, Kubernetes 1.34+)
-- [ ] ACM 5.0 installed (use `install-acm.sh` from acm-cluster-setup)
-- [ ] Ollama running with `OLLAMA_HOST=0.0.0.0 OLLAMA_ORIGINS=* ollama serve`
-- [ ] ngrok tunnel running: `ngrok http 11434`
-- [ ] Note your ngrok URL: `https://xxx.ngrok-free.app`
-
-### Step 1: Install agentic operator
+### Step 2: Create credentials secret on cluster
 
 ```bash
-bash <(curl -fsSL https://raw.githubusercontent.com/openshift/lightspeed-agentic-operator/main/hack/quickstart/install.sh)
-```
-
-Wait for pods:
-```bash
-oc get pods -n openshift-lightspeed -w
-# Expected: lightspeed-agentic-operator + lightspeed-agentic-console-plugin running
-```
-
-### Step 2: Create credentials secret
-
-The secret key MUST be `OPENAI_API_KEY` (even for Ollama — it's just an API compatibility convention):
-```bash
-oc create secret generic ollama-credentials \
-  --from-literal=OPENAI_API_KEY=ollama-no-key \
+# Key name MUST be GOOGLE_APPLICATION_CREDENTIALS (entire JSON key file as value)
+oc create secret generic llm-creds-vertex \
+  --from-file=GOOGLE_APPLICATION_CREDENTIALS=/tmp/vertex-sa-key.json \
   -n openshift-lightspeed
 ```
 
@@ -210,14 +109,16 @@ cat <<EOF | oc apply -f -
 apiVersion: agentic.openshift.io/v1alpha1
 kind: LLMProvider
 metadata:
-  name: ollama-granite
+  name: vertex-anthropic
   namespace: openshift-lightspeed
 spec:
-  type: OpenAI
-  openAI:
-    url: https://YOUR-NGROK-URL.ngrok-free.app/v1
+  type: GoogleCloudVertex
+  googleCloudVertex:
+    projectID: "itpc-gcp-hcm-pe-eng-claude"
+    region: "us-east5"
+    modelProvider: Anthropic
     credentialsSecret:
-      name: ollama-credentials
+      name: llm-creds-vertex
 EOF
 ```
 
@@ -232,12 +133,42 @@ metadata:
   namespace: openshift-lightspeed
 spec:
   llmProvider:
-    name: ollama-granite
-  model: granite3.3:8b
+    name: vertex-anthropic
+  model: "claude-sonnet-4@20250514"
+  timeouts:
+    analysisSeconds: 120
+    executionSeconds: 120
+    verificationSeconds: 120
 EOF
 ```
 
-### Step 5: Apply extended RBAC
+---
+
+## Full Setup Guide (Fresh Cluster)
+
+### Prerequisites checklist
+
+- [ ] OpenShift cluster (OCP 4.21+, Kubernetes 1.34+)
+- [ ] ACM 5.0 installed (use `install-acm.sh` from acm-cluster-setup)
+- [ ] GCP service account key file at `/tmp/vertex-sa-key.json`
+
+### Step 1: Install agentic operator
+
+```bash
+bash <(curl -fsSL https://raw.githubusercontent.com/openshift/lightspeed-agentic-operator/main/hack/quickstart/install.sh)
+```
+
+Wait for pods:
+```bash
+oc get pods -n openshift-lightspeed -w
+# Expected: lightspeed-agentic-operator + lightspeed-agentic-console-plugin running
+```
+
+### Step 2: Configure LLM (Vertex/Claude)
+
+Follow the four steps in the **LLM Setup** section above.
+
+### Step 3: Apply extended RBAC
 
 ```bash
 oc apply -f /path/to/agentic-ols/rbac/agent-extended.yaml
@@ -245,103 +176,57 @@ oc apply -f /path/to/agentic-ols/rbac/agent-extended.yaml
 
 This grants Prometheus access + pod exec (needed for database diagnostics).
 
-### Step 6: Verify sandbox readiness
+### Step 4: Add pull secret for skills image
 
-Submit a test proposal and check the sandbox pod's `/ready` endpoint:
+The sandbox pod pulls the skills OCI image. If it's in a private quay repo:
 ```bash
-# Submit proposal
-oc apply -f proposals/search-indexer-health.yaml
-
-# Wait for sandbox pod, then check readiness
-oc exec -n openshift-lightspeed ls-analysis-search-indexer-health -- \
-  curl -s http://localhost:8080/ready
-# Should return: {"status":"ok"}
-```
-
-If `/ready` returns `{"status":"error","checks":{"provider_env":"error: missing OPENAI_API_KEY"}}`:
-→ The secret key name is wrong. Recreate it with key `OPENAI_API_KEY` (not `apiKey`).
-
-If `/ready` returns 503 with `"provider_endpoint":"error"`:
-→ The sandbox can't reach your Ollama. Check ngrok is running and Ollama has `OLLAMA_ORIGINS=*`.
-
----
-
-## Known Issues and Gotchas
-
-### 1. Secret key must be `OPENAI_API_KEY`
-
-Even for Ollama (which doesn't use an API key), the sandbox reads the `OPENAI_API_KEY`
-env var. If you create the secret with a different key name (like `apiKey`), the sandbox
-reports `/ready` → 503 with "missing OPENAI_API_KEY". Fix:
-```bash
-oc delete secret ollama-credentials -n openshift-lightspeed
-oc create secret generic ollama-credentials \
-  --from-literal=OPENAI_API_KEY=ollama-no-key \
-  -n openshift-lightspeed
-```
-
-### 2. Ollama CORS blocks cluster requests (403 Forbidden)
-
-By default Ollama only accepts connections from known origins. The cluster pods
-are treated as foreign and get 403. Fix: always start Ollama with `OLLAMA_ORIGINS=*`:
-```bash
-OLLAMA_HOST=0.0.0.0 OLLAMA_ORIGINS=* ollama serve &
-```
-
-### 3. Smaller LLMs miss AnalysisResult schema fields
-
-The AnalysisResult CRD has strict required fields in `status.options[0]`:
-- `diagnosis.confidence`, `diagnosis.rootCause`, `diagnosis.summary` (required)
-- `proposal.description`, `proposal.estimatedImpact`, `proposal.actions`, `proposal.risk` (required)
-- `verification.description` (required)
-
-granite3.3:8b often misses `proposal.estimatedImpact` or `proposal.actions`.
-**Fix:** Make the skill's SKILL.md output section explicitly list all required fields
-with examples. The sandbox includes the SKILL.md in the LLM prompt.
-
-Example of what to add to SKILL.md:
-```
-## Output Format
-
-Your response MUST include ALL these fields:
-
-diagnosis.confidence: "High" | "Medium" | "Low"
-diagnosis.rootCause: one sentence
-diagnosis.summary: paragraph
-
-proposal.description: what to do
-proposal.estimatedImpact: "Expected improvement (e.g. latency reduced by X%)"
-proposal.actions:
-  - Step 1
-  - Step 2
-proposal.risk: "Low" | "Medium" | "High"
-
-verification.description: how to verify the fix
-```
-
-### 4. Skills image pull fails (ImagePullBackOff)
-
-The sandbox pod tries to pull your custom skills image. If it's in a private quay repo:
-```bash
-# Create pull secret in openshift-lightspeed namespace
 oc create secret docker-registry quay-skills \
   --docker-server=quay.io \
   --docker-username=<user> \
   --docker-password='<password>' \
   -n openshift-lightspeed
 
-# Patch the service accounts
 oc patch serviceaccount default -n openshift-lightspeed \
   --type=json -p '[{"op":"add","path":"/imagePullSecrets/-","value":{"name":"quay-skills"}}]'
 oc patch serviceaccount lightspeed-agent -n openshift-lightspeed \
   --type=json -p '[{"op":"add","path":"/imagePullSecrets/-","value":{"name":"quay-skills"}}]'
 ```
 
-### 5. Building skills image requires podman not docker
+### Step 5: Submit a proposal and verify
+
+```bash
+oc apply -f proposals/search-indexer-health.yaml
+
+# Read the result
+RESULT=$(oc get proposal search-indexer-health -n openshift-lightspeed \
+  -o jsonpath='{.status.steps.analysis.results[0].name}')
+oc get analysisresult "$RESULT" -n openshift-lightspeed \
+  -o jsonpath='{.status.options[0].diagnosis.summary}'
+```
+
+---
+
+## Known Issues and Gotchas
+
+### 1. LLMProvider type and secret key differ by backend
+
+| Backend | `spec.type` | Secret key name | Secret value |
+|---|---|---|---|
+| Vertex / Claude | `GoogleCloudVertex` | `GOOGLE_APPLICATION_CREDENTIALS` | Full JSON SA key file |
+| OpenAI | `OpenAI` | `OPENAI_API_KEY` | API key string |
+
+Do not mix them up — e.g. using `OPENAI_API_KEY` for a Vertex provider will fail silently.
+
+### 2. Skills image pull fails (ImagePullBackOff)
+
+The sandbox pod pulls the skills image at runtime. If your quay.io repo is private,
+the cluster needs a pull secret (see Step 4 above). Alternatively, make the image public
+on quay.io to skip this step entirely.
+
+### 3. Building skills image requires linux/amd64
 
 The Makefile uses `podman`. If you only have Docker:
 ```bash
-# Override in Makefile or use directly:
 docker buildx build --platform linux/amd64 \
   -t quay.io/<user>/acm-agentic-skills:tag . --push
 ```
@@ -388,7 +273,7 @@ Structure:
 5. **Assessment Methodology** — step-by-step what the agent should do
 6. **Health Thresholds** — table of healthy vs degraded vs critical values
 7. **Confidence Scoring** — how to assign confidence level
-8. **Output Format** — EXPLICIT list of all required AnalysisResult fields (critical for small LLMs)
+8. **Output Format** — explicit list of all required AnalysisResult fields
 9. **Standalone Usage** — how to run scripts manually
 
 ### Step 5: Build and push
@@ -410,7 +295,6 @@ metadata:
 spec:
   request: |
     Using the search-COMPONENT-impact skill, assess the health of...
-    [Include explicit reminder about required output fields]
   tools:
     skills:
       - image: quay.io/<user>/acm-agentic-skills:tag
@@ -448,137 +332,19 @@ Reference the existing backup triage knowledge at `ai-tools/projects/acm-backup-
 
 ---
 
----
-
-## Production-Quality LLM Setup (Beyond Hackathon)
-
-The agentic-ols operator uses the **OpenAI Responses API** (`POST /v1/responses`),
-which expects structured JSON output with strict schema enforcement. Small local models
-(granite3.3:8b, 8B params) produce the right ideas but randomly drop required fields.
-This makes output fail the AnalysisResult CRD validation. Here's how to get reliable output:
-
-### Option 1 — Red Hat OpenShift AI MaaS (RECOMMENDED — no personal API key)
-
-Red Hat runs **Models-as-a-Service (MaaS)** internally via OpenShift AI. It serves
-IBM Granite models (same family as local Ollama but bigger/better) via an
-OpenAI-compatible API. It uses your OCP bearer token — no personal account needed.
-
-**How to get access:** Ask your team lead or Red Hat IT for the internal RHOAI/MaaS endpoint.
-
-```bash
-# Use your OCP token as the API key
-TOKEN=$(oc whoami -t)
-oc create secret generic rhoai-credentials \
-  --from-literal=OPENAI_API_KEY=$TOKEN \
-  -n openshift-lightspeed
-
-cat <<EOF | oc apply -f -
-apiVersion: agentic.openshift.io/v1alpha1
-kind: LLMProvider
-metadata:
-  name: rhoai-granite
-  namespace: openshift-lightspeed
-spec:
-  type: OpenAI
-  openAI:
-    url: https://maas.CLUSTER_DOMAIN/llm/ibm-granite-3b-gpu/v1
-    credentialsSecret:
-      name: rhoai-credentials
-EOF
-```
-
-No ngrok needed — the MaaS endpoint is already on the corporate network.
-
-### Option 2 — Shared OpenAI API key (most reliable, best schema compliance)
-
-The project was built and tested against GPT-4. With a shared project key (not personal):
-```bash
-oc create secret generic llm-creds-openai \
-  --from-literal=OPENAI_API_KEY=sk-TEAM-KEY \
-  -n openshift-lightspeed
-```
-
-Cost: ~$0.01/run with gpt-4o-mini. Ask your team lead for a shared project key.
-
-### Option 3 — Vertex AI / Claude (in quickstart, first-class support)
-
-If your team has a GCP service account, Claude-3.5-Sonnet via Vertex gives GPT-4 level
-quality. The quickstart has a ready-to-use YAML for this.
-
-### Option 4 — Deploy Ollama on cluster with 70B model (no ngrok, no cloud)
-
-```bash
-# Deploy Ollama as a pod on the cluster
-cat <<EOF | oc apply -f -
-apiVersion: apps/v1
-kind: Deployment
-metadata:
-  name: ollama
-  namespace: openshift-lightspeed
-spec:
-  replicas: 1
-  selector:
-    matchLabels: {app: ollama}
-  template:
-    metadata:
-      labels: {app: ollama}
-    spec:
-      containers:
-      - name: ollama
-        image: ollama/ollama:latest
-        env:
-        - name: OLLAMA_HOST
-          value: "0.0.0.0"
-        ports:
-        - containerPort: 11434
----
-apiVersion: v1
-kind: Service
-metadata:
-  name: ollama
-  namespace: openshift-lightspeed
-spec:
-  selector: {app: ollama}
-  ports:
-  - port: 11434
-EOF
-
-# Pull a bigger model (70B gives much better schema compliance, needs ~40GB)
-oc exec -it deploy/ollama -n openshift-lightspeed -- ollama pull llama3:70b
-```
-
-Then LLMProvider URL = `http://ollama.openshift-lightspeed.svc:11434/v1` — no ngrok.
-
-### LLM comparison for structured output compliance
-
-| LLM | Schema compliance | Cost | Setup complexity |
-|---|---|---|---|
-| GPT-4 / GPT-4o | ⭐⭐⭐⭐⭐ Excellent | ~$0.01/run | Easy (one API key) |
-| Claude 3.5 Sonnet | ⭐⭐⭐⭐⭐ Excellent | ~$0.01/run | Need Vertex or Anthropic key |
-| RHOAI MaaS Granite (3B+) | ⭐⭐⭐⭐ Good | Free internal | Need RHOAI access |
-| llama3:70b (local/cluster) | ⭐⭐⭐⭐ Good | Free | Needs 40GB RAM |
-| granite3.3:8b (local) | ⭐⭐ Poor | Free | Easy but unreliable |
-| mistral:7b (local) | ⭐⭐ Poor | Free | Easy but unreliable |
-
-**Bottom line:** For mergeable, production-usable skills → use RHOAI MaaS or a shared
-OpenAI key. For hackathons/demos where schema failures are acceptable → local Ollama is fine.
-
----
-
 ## Quick Reference
 
 ```bash
-# Ollama start (correct)
-OLLAMA_HOST=0.0.0.0 OLLAMA_ORIGINS=* ollama serve &
-
-# ngrok tunnel
-ngrok http 11434
-
 # Install agentic operator
 bash <(curl -fsSL https://raw.githubusercontent.com/openshift/lightspeed-agentic-operator/main/hack/quickstart/install.sh)
 
-# Check sandbox readiness
-oc exec -n openshift-lightspeed <sandbox-pod> -- curl -s http://localhost:8080/ready
+# Create Vertex/Claude credentials secret
+oc create secret generic llm-creds-vertex \
+  --from-file=GOOGLE_APPLICATION_CREDENTIALS=/tmp/vertex-sa-key.json \
+  -n openshift-lightspeed
+
+# Apply RBAC
+oc apply -f /path/to/agentic-ols/rbac/agent-extended.yaml
 
 # Read proposal result
 RESULT=$(oc get proposal <name> -n openshift-lightspeed \
@@ -586,24 +352,8 @@ RESULT=$(oc get proposal <name> -n openshift-lightspeed \
 oc get analysisresult "$RESULT" -n openshift-lightspeed \
   -o jsonpath='{.status.options[0].diagnosis.summary}'
 
-# Build skills image with Docker (not podman)
+# Build and push skills image
 cd /path/to/agentic-ols
 docker buildx build --platform linux/amd64 \
   -t quay.io/saharebrahimi/acm-agentic-skills:tag . --push
-
-# Check if agent can reach Ollama (from inside sandbox)
-oc exec -n openshift-lightspeed <sandbox-pod> -- \
-  python3 -c "
-import urllib.request, ssl, json
-ctx = ssl.create_default_context()
-ctx.check_hostname = False
-ctx.verify_mode = ssl.CERT_NONE
-req = urllib.request.Request(
-  'https://YOUR-NGROK-URL/v1/chat/completions',
-  data=json.dumps({'model':'granite3.3:8b','messages':[{'role':'user','content':'hi'}],'max_tokens':5}).encode(),
-  headers={'Content-Type':'application/json','Authorization':'Bearer ollama-no-key'}
-)
-r = urllib.request.urlopen(req, context=ctx, timeout=30)
-print('Status:', r.status)
-"
 ```
