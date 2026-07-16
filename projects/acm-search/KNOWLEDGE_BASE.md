@@ -1158,6 +1158,130 @@ oc exec -n open-cluster-management $DB_POD -- \
 
 ---
 
+## Built-in Integration CollectorConfigs (ACM-37052, Jul 2026)
+
+Follow-on to the exclude action above: the webhook's `protectedAPIGroups` safety net (28 hardcoded
+apiGroups) was always meant to be temporary — the comment on it literally said "until integration
+teams ship labeled CollectorConfig CRs." ACM-37052 is that follow-through: give integration teams
+a way to ship a real CollectorConfig without writing Go code, then shrink the static list to only
+what's left uncovered (6 groups: core `""`, `config.openshift.io`, `template.openshift.io`,
+`admissionregistration.k8s.io`, `operator.open-cluster-management.io`,
+`search.open-cluster-management.io` — none of these have a single clear integration-team owner,
+or are Search's own dependencies).
+
+### Architecture — "drop a YAML, no Go code needed"
+
+- **Where teams contribute**: `search-v2-operator/config/integration_collector_configs/*.yaml` —
+  one plain `CollectorConfig` manifest per team (`cnv.yaml`, `olm.yaml`, `grc.yaml`,
+  `kyverno.yaml`, `gatekeeper.yaml`, `argo.yaml`, `app-lifecycle.yaml`). Each carries the
+  `search.open-cluster-management.io/config-type: integration` label and `include` rules for
+  that team's known apiGroups (sourced from what was already hardcoded in
+  `search-collector/pkg/transforms/genericResourceConfig.go` and the remaining typed builders in
+  `transformer.go`).
+- **How they reach the cluster**: `config/integrationconfigs.go` embeds that directory
+  (`//go:embed`) at build time. `IntegrationCollectorConfigSeeder`
+  (`controllers/integration_collectorconfig_seeder.go`) is a `manager.Runnable` added via
+  `mgr.Add(...)` in `main.go` — it runs its `Start` **once per operator process, at manager
+  startup, not on every reconcile.** `Start` calls `applyIntegrationCollectorConfigs`
+  (`controllers/create_integration_collectorconfigs.go`), which walks the embedded files and, for
+  each, **unconditionally creates or overwrites** the CR with that fixed name.
+- **Update policy — final version, after simplifying away the hash-based approach below**: no
+  diffing, no hash, no attempt to detect "is this a new release." Because the seeder only runs
+  once at startup, a team can freely edit their canonical config
+  (`cnv-integration-collector-config`, etc.) and it survives for the life of that pod — the next
+  restart/upgrade unconditionally resets it to whatever's currently embedded, no matter what. A
+  team that wants a change to survive across restarts *before* it's officially shipped creates a
+  **differently-named** CollectorConfig instead (e.g. `cnv-integration-collector-config-2`) — the
+  seeder only knows its fixed set of embedded names, so anything else is left alone entirely, and
+  the merge step already discovers integration configs by label rather than name, so it picks up
+  any number of them automatically. To ship a change permanently, the team PRs their YAML; the
+  next operator upgrade applies it to every cluster that hasn't switched to an override name.
+
+### Design decisions and why (Jul 15-16 2026 team discussion — Spencer, Jorge)
+
+This went through three iterations before landing on the above. Recording all three because the
+reasoning for rejecting the first two is exactly what justifies the final, simpler design.
+
+**Iteration 1 — content-hash + drift detection (rejected as more complex than needed for TP):**
+stamp a `config-hash` annotation (sha256 of the spec) on create/update; each reconcile, compare
+the *live* spec's hash to the stamp to detect "was this customized," and separately compare the
+stamp to the *currently shipped* YAML's hash to detect "did a new release change the default" —
+only overwrite when the shipped hash changed AND the live object hasn't drifted from the stamp.
+Technically sound (same idea as `kubectl apply`'s `last-applied-configuration` 3-way comparison),
+but Spencer/Jorge decided it was more machinery than tech preview needs.
+
+**Iteration 2 — `sync.Once` to gate "create if not found" (rejected — provably broken):**
+`sync.Once` is scoped to the *process* lifetime, not the *cluster's* lifetime, and doesn't
+distinguish "ran successfully" from "ran and failed." Two separate problems found:
+1. (Spencer) If the operator's first reconcile happens before the `ValidatingWebhookConfiguration`
+   has its CA bundle injected (a known startup race — see the "search-v2-operator webhook TLS
+   failure" entry elsewhere in this doc), the wrapped `Create()` call fails, but `sync.Once` marks
+   itself "done" regardless — it would never retry again for the rest of that pod's life.
+2. (Jorge) Pods restart constantly (upgrades, crashes, node drains). Each restart is a fresh
+   process, so a fresh `sync.Once` — if the wrapped logic unconditionally re-applies the YAML, a
+   restart would silently wipe out any live customization a team made, far more often than
+   "once" implies.
+
+**Iteration 3 / final — unconditional overwrite, but only via a dedicated startup Runnable, never
+in the regular Reconcile() loop:** this sidesteps needing to know "is this a new release" at all
+(iteration 1's whole reason for existing) by not caring — a pod start always means "reset to
+current shipped state," whether it's a genuine upgrade or just a restart. It sidesteps
+`sync.Once`'s exact failure mode by using `wait.PollUntilContextCancel` inside `Start` to retry on
+a fixed interval until the first attempt succeeds, then return — "run once" with resilience to
+transient early failures, without conflating "attempted" with "succeeded." Persistence of
+customizations across restarts is handled entirely by the differently-named-config convention,
+not by the seeder trying to protect anything.
+
+**Known accepted limitations (tech preview, explicitly not silently deferred):**
+- A customization to the canonical name only survives until the next restart — there is no
+  "protect this from being reset" mechanism; the differently-named-config convention is the *only*
+  way to persist a change across restarts before it ships officially.
+- Deleting a canonical config to intentionally disable a team's default collection doesn't work —
+  the next pod start just recreates it (there's no "permanently disabled" marker).
+- There's no cleanup path if a team removes their YAML file entirely — the previously-created CR
+  becomes orphaned (stays on cluster with stale rules, nothing deletes it).
+
+### Real bug caught by live cluster testing (Jul 16 2026)
+
+Deployed a custom operator image with the first version of this code to a live ACM 5.0.0-153
+install and the seeder immediately errored: `"an empty namespace may not be set during creation"`.
+Root cause: `main.go` passed `os.Getenv("WATCH_NAMESPACE")` as the seeder's target namespace, and
+that env var (along with `POD_NAMESPACE`) was **empty** on this real deployment — confirmed via
+`oc get deployment search-v2-operator-controller-manager -o jsonpath='{...env...}'`. The rest of
+the reconciler never hits this because `main.go` only restricts the manager's cache to a namespace
+`if watchNs != ""` — when it's empty (as here), the manager watches cluster-wide, and every
+`Reconcile()` call gets its namespace from the `Search` object it's reconciling, not from an env
+var. **Lesson**: never assume an operator env var is populated just because it's part of the
+"standard" set (`WATCH_NAMESPACE`/`POD_NAMESPACE`) — verify against a real deployment, since the
+CSV/OLM templating for these can differ across install paths (downstream vs. dev build vs. local
+`make run`). Fixed by having the seeder discover its namespace the same way the rest of the
+reconciler effectively does — list `SearchList` cluster-wide and find the one named `OperatorName`
+(there's always exactly one) — retrying via the existing poll loop if the CR doesn't exist yet
+(covers a genuinely fresh install where the CR hasn't been created at the moment the seeder first
+runs). See `resolveNamespace` in `integration_collectorconfig_seeder.go`.
+
+Also caught while testing: the `Dockerfile`'s builder stage explicitly lists which source
+directories to `COPY` (`main.go`, `api/`, `controllers/`, `addon/`) rather than copying everything
+— the new `config/` package (containing the `go:embed` directive) wasn't in that list, so the
+first Docker build would have failed to find the package. Added `COPY config/ config/`. Doesn't
+bloat the final image — it's a multi-stage build and only the compiled `manager` binary gets
+copied into the final `ubi9/ubi-minimal` stage, not any source.
+
+### Related files
+
+| File | Purpose |
+|---|---|
+| `search-v2-operator/config/integration_collector_configs/*.yaml` | The 7 shipped integration configs |
+| `search-v2-operator/config/integrationconfigs.go` | `go:embed` of the above directory |
+| `search-v2-operator/controllers/integration_collectorconfig_seeder.go` | `manager.Runnable`, retry-until-success startup logic |
+| `search-v2-operator/controllers/integration_collectorconfig_seeder_test.go` | Seeder start/retry/leader-election tests |
+| `search-v2-operator/controllers/create_integration_collectorconfigs.go` | Unconditional create-or-overwrite logic |
+| `search-v2-operator/controllers/create_integration_collectorconfigs_test.go` | Create, no-op-when-unchanged, overwrites-customization, ignores-other-names tests |
+| `search-v2-operator/api/v1alpha1/collectorconfig_webhook.go` | Shrunk `protectedAPIGroups` (28 → 6 groups) |
+| `search-v2-operator/main.go` | `mgr.Add(&controllers.IntegrationCollectorConfigSeeder{...})` |
+
+---
+
 ## Future Opportunities — Search Team Priorities (Spencer McAvey, Jul 2026)
 
 Internal priorities doc from Spencer, not an official public roadmap. Captures known
