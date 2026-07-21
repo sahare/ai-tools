@@ -21,6 +21,10 @@ It does **NOT** handle:
 3. **Only delete ManagedClusters from the old hub if:** (a) restore is fully complete on the new hub, (b) clusters show `Unknown` on the old hub (meaning they've moved), and (c) you don't plan to failback to that hub.
 4. **The docs explicitly say:** "If you want to restore the data to the backup after your recovery test completes, skip cleaning the resources."
 
+5. **When advising on `cleanupBeforeRestore`, always default to the safest option.** For partial/incremental migrations or "move managed clusters" scenarios, ALWAYS recommend `cleanupBeforeRestore: None`. It's additive and non-destructive. Only recommend `CleanupRestored` for standard active/passive sync restores where the passive hub's data should mirror the active hub's backups. Never recommend `CleanupAll` without extreme justification.
+6. **For "move managed clusters" repeated operations:** Step 0 (restore policies/apps/credentials) is cheap and safe with `cleanupBeforeRestore: None`. When in doubt, recommend running it again to pick up any delta from the source hub. Do NOT recommend skipping it unless you are certain nothing changed on the source hub — the risk of missing new policies outweighs the cost of a redundant restore.
+7. **The `open-cluster-management-agent` and `open-cluster-management-agent-addon` namespaces** should be excluded from restores on a different hub. They contain hub-specific klusterlet credentials (`hub-kubeconfig-secret`). While these secrets typically don't have backup labels (and thus shouldn't appear in backups), always recommend excluding these namespaces as a safeguard in "move managed clusters" scenarios.
+
 ## Ownership Boundaries
 
 | Component | Team | Slack Channel |
@@ -110,6 +114,13 @@ Resources are backed up in two categories:
 | **CleanupAll** | Removes **all** resources that could be part of an ACM backup, even if not created by a restore. **Use with extreme caution** — this deletes user-created resources too. |
 
 **CleanupRestored detail:** For secrets/configmaps, requires the `velero.io/backup-name` label to exist AND point to a different backup than the current one. For dynamic resources, uses label selectors matching the backup's included resource kinds. Resources with `velero.io/exclude-from-backup: true` are never cleaned up. Resources in the `local-cluster` namespace and MCH namespace are excluded from cleanup.
+
+**When to recommend each value:**
+- `None` — "move managed clusters" scenarios, first restore on a new hub, incremental migrations, any scenario where you DON'T want to delete existing resources on the target hub
+- `CleanupRestored` — standard active/passive activation restore, failback to primary, anywhere the target hub should mirror the source backup exactly
+- `CleanupAll` — almost never; only for complete hub reset scenarios where ALL existing ACM data should be wiped before restore
+
+**Common mistake:** Recommending `CleanupRestored` for "move managed clusters" — this can delete resources on Hub 2 that were created by a previous restore but aren't in the current backup (e.g., if a cluster was moved earlier and its resources got the `velero.io/backup-name` label).
 
 ## OADP Version Compatibility
 
@@ -397,6 +408,33 @@ See the [OADP Version Compatibility](#oadp-version-compatibility) table above.
 **Strong recommendation:** Full active/passive with identical hubs is the supported, well-tested path.
 **Cleanup is optional** — the doc says "you can choose to clean up."
 **Blog:** https://developers.redhat.com/learn/openshift/move-managed-clusters-using-acm-212-backup-component
+
+### 10b. "Incremental/repeated cluster migration (move one cluster at a time)"
+**Category:** Architecture guidance — NOT OFFICIALLY TESTED
+**Context:** Customer moves cluster A from Hub 1 to Hub 2 one week, then wants to move cluster B the next week. Hub 1 stays active throughout.
+
+**Key insight:** The blog's "move subset" workflow is designed as a single operation, not for repeated use over time. However, it CAN work incrementally with proper understanding:
+
+**Step 0 (policies/apps/credentials):**
+- NOT cluster-specific — restores ALL user resources from the latest backup
+- Safe to repeat with `cleanupBeforeRestore: None` (additive)
+- RECOMMEND re-running if Hub 1 had any policy/app/credential changes since last step 0
+- When in doubt, run it — cost is low, risk of skipping is higher
+
+**Steps 1 + 2 (cluster namespace + ManagedCluster activation):**
+- ARE cluster-specific — only bring over the target cluster's data
+- Must be run for each cluster being moved
+- Step 1 `includedNamespaces` should list only the new cluster's namespace
+- Step 2 `orLabelSelectors` should match only the new cluster's ManagedCluster
+
+**Namespace exclusions for step 0 (cumulative):**
+- All managed cluster namespaces (already moved + about to move)
+- `open-cluster-management-agent`
+- `open-cluster-management-agent-addon`
+
+**Why policies auto-apply to new clusters:** ACM governance uses Placement to select clusters by labels. Once a ManagedCluster resource lands on Hub 2 (step 2), existing Placements evaluate it and policies propagate automatically. This is why step 0 doesn't need to be cluster-specific.
+
+**NOT officially tested by QE.** Advise customers to test on non-critical clusters first.
 
 ### 11. "Primary hub still running, want to move clusters to new hub"
 **Category:** Informational / procedure
