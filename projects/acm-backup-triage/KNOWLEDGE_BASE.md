@@ -214,6 +214,23 @@ For planned maintenance, DR testing, or intentional site switches (not just disa
 
 **Docs:** Business Continuity guide, sections "Restoring activation resources", "Backup Collisions", "Restoring data to the initial hub cluster"
 
+## Restore Is a Soft Reconnect, Not a Detach/Reattach
+
+**Source:** internal Slack thread, 2026-07-24, jbanerje/Subbarao Meduri raising an Observability-addon concern, answered by Valentina Birsan (vbirsan). Cross-team architectural clarification, not customer-specific — kept here since it directly informs how we should describe restore/activation behavior to customers and how addon teams should reason about DR events.
+
+**The question:** does ACM backup/restore put managed clusters through the same detach → reattach cycle as a manual `oc delete managedcluster` + re-import? A traditional detach cleans up spoke-side state (policies, ManifestWork-deployed resources, addon config) — which would be far more invasive than customers doing a "planned failover" would expect, and could cause disruptive side effects for addons that react to detach events (e.g., the Observability addon touching the CMO ConfigMap and restarting spoke Prometheus).
+
+**Answer (confirmed architecture, not the detach path):**
+- Activation restore on the new hub restores `ManagedCluster`, `ManagedClusterAddOn`, `KlusterletAddonConfig`, etc. as data — it does **not** run the detach/cleanup finalizer logic that a real `ManagedCluster` deletion would trigger.
+- The import/MSA auto-import mechanism's role on the spoke is **intentionally narrow**: it only gets/updates the `bootstrap-hub-kubeconfig` secret on the spoke. (This is the same secret referenced in the ACM-34619/ACM-38012 work-agent race we already have documented above — reinforces that `bootstrap-hub-kubeconfig` is the single, minimal point of contact for hub redirection.)
+- The klusterlet then re-registers to the new hub using that updated bootstrap kubeconfig (new CSRs, new hub kubeconfig) — this is a **re-registration**, not a teardown-and-reimport.
+- **There is no detach-finalizer path in the restore flow that tears down addons, policies, or custom resources on the spoke.** Any cleanup that happens is scoped to the *hub* side (see `CleanupRestored`/`CleanupAll` in `restore_post.go`), not the spoke.
+- **Implication for addon teams:** each addon is individually responsible for detecting "my hub's identity/fingerprint changed" and reconciling (e.g., re-registering with the new hub) — the restore process does not do this for them generically. Per vbirsan, the application-addon was previously *missing* this re-registration step and was fixed by Xiangjing Li. Other addons (e.g., Observability, per Subbarao's original question) should verify they handle this "soft reconnect" signal correctly and don't assume a full detach/reattach semantics that would justify actions like restarting spoke Prometheus.
+- **Documentation gap noted in the thread:** current external docs only describe *how MSA auto-import works*, not this broader "restore is a soft reconnect, addons must react on their own" architecture point — Subbarao asked and vbirsan confirmed this low-level detail isn't spelled out for customers or addon teams today.
+- **Reference:** [README — Automatically connecting clusters using ManagedServiceAccount](https://github.com/stolostron/cluster-backup-operator#automatically-connecting-clusters-using-managedserviceaccount)
+
+**Relevance to the ACM-38215 MSA ownerRef bug (2026-07-24, see below):** this clarifies that the *only* spoke-side mechanism restore relies on is the narrow `bootstrap-hub-kubeconfig` update — separate and upstream from the *hub-side* `auto-import-account` token secret refresh problem. The two are related (both are part of "how a spoke reconnects after restore") but are different failure surfaces: one is spoke-side kubeconfig routing (work-agent race, ACM-34619/38012), the other is hub-side MSA token refresh permissions (ACM-38215).
+
 ## Argo CD / ApplicationSet DR Considerations
 
 When the hub runs Argo CD ApplicationSets (especially the ACM-Argo CD pull model), DR has additional risks due to cascade deletion chains.
