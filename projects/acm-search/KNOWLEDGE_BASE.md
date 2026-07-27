@@ -1280,6 +1280,66 @@ copied into the final `ubi9/ubi-minimal` stage, not any source.
 | `search-v2-operator/api/v1alpha1/collectorconfig_webhook.go` | Shrunk `protectedAPIGroups` (28 → 6 groups) |
 | `search-v2-operator/main.go` | `mgr.Add(&controllers.IntegrationCollectorConfigSeeder{...})` |
 
+### Spencer's review feedback (Jul 23 2026) — addressed in PR #757
+
+Four changes requested and implemented:
+
+1. **Log and continue on single config failure** — previously `applyIntegrationCollectorConfigsFrom`
+   aborted the entire loop if one config failed. Now logs the error and continues to the next file.
+   The seeder retries the whole batch on the next interval, so transient failures self-heal.
+
+2. **Backup label on all integration configs** — added `cluster.open-cluster-management.io/backup: ""`
+   to all 7 YAML manifests so they survive hub backup/restore. Without it, a hub restore wouldn't
+   include these CRs (the `search.open-cluster-management.io` API group is excluded from automatic
+   backups by Velero; only the backup label gets them into `acm-resources-generic-schedule`).
+
+3. **OwnerReference to Search CR** — integration configs now get `controllerutil.SetControllerReference`
+   pointing to the Search CR on create/update. This means they're garbage-collected when Search is
+   torn down, consistent with all other operator-managed resources (Deployments, Services, Secrets,
+   etc. all use the same pattern). Required refactoring `resolveSearch` to return the full `*Search`
+   object (not just namespace + pause state) and passing a `Scheme` through to the apply functions.
+
+4. **Future: granular fields** — Spencer noted that eventually these should be more granular (like
+   `genericResourceConfig.go`'s per-kind field definitions) so each integration team sees ALL their
+   configured properties in one file. Not done yet — current configs only declare apiGroup ownership.
+
+### Collector-side fix: bare include rules being silently skipped (Jul 27 2026)
+
+**Problem found during Spencer's testing of PR #757:** the collector's
+`configurableCollection.go:163-168` had a check that skipped any include rule without
+`fields`/`collectConditions`/`collectAnnotations`/`collectAdditionalPrinterColumnsPriority`. This
+was correct before excludes existed (an include with nothing to enrich was pointless). But now that
+excludes exist, a bare include is meaningful — it can re-include a resource that was previously
+excluded by a broader wildcard rule. All 7 integration configs were silently skipped, producing:
+```
+W0723 configurableCollection.go:165] Skipping collection rule. Include action without fields...
+```
+
+**Fix (PR #925 on search-collector):** moved the `appendExcludeRule(ActionInclude)` call to happen
+BEFORE the "does this rule have anything to enrich?" check. Now the include action is always
+registered in the exclude-override evaluation (canceling prior excludes for the same resource).
+If there's nothing else to process, the rule simply `continue`s without warning.
+
+**Key insight:** `appendExcludeRule` is what makes `IsResourceExcluded()` return `false` for a
+resource — it appends an `ActionInclude` entry to `excludeRules`, which the matching logic checks
+after any prior `ActionExclude` for the same group/kind. Without registering the include, the
+collector would still exclude resources that an integration team intended to collect.
+
+### Additional CodeRabbit/Sonar fixes applied to PR #757 (Jul 16 2026)
+
+- **Missing integration label reconciliation**: a pre-existing canonical config without
+  `IntegrationTeamLabel` is now relabeled on update — both the webhook's exclude-overlap check
+  and the merge step discover integration configs by this label, so missing it = invisible.
+- **Honor `search-pause` before seeding**: the seeder now checks the Search CR's `search-pause`
+  annotation and defers writes while paused, consistent with `Reconcile`.
+- **Reject ambiguous singleton discovery**: `resolveSearch` requires exactly one `Search` CR named
+  `OperatorName` instead of returning the first match — prevents silently seeding the wrong
+  namespace if duplicates exist.
+- **Dockerfile.rhtap fix**: Konflux builds from a separate `Dockerfile.rhtap` (not the plain
+  `Dockerfile`). It was missing `COPY config/ config/`, causing `go mod vendor` to fail.
+- **Lint timeout**: bumped `golangci-lint --timeout` from 3m to 8m in both `Makefile` and
+  `Makefile.prow` — the codebase outgrew the old deadline on CI hardware.
+
 ---
 
 ## Future Opportunities — Search Team Priorities (Spencer McAvey, Jul 2026)
