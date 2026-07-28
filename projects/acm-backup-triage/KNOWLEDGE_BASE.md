@@ -34,6 +34,7 @@ It does **NOT** handle:
 | MultiClusterHub, operator installation, cluster-backup chart deployment | **MCH/MCE team** | #forum-acm |
 | ManagedServiceAccount, addon framework | **MCE/Foundation team** | #forum-acm |
 | Managed cluster import/detach mechanics | **Foundation team** | #forum-acm |
+| InfraEnv, AgentClusterInstall, `infraenvvalidators` admission webhook | **Infrastructure Operator / MGMT (assisted-service) team** | #forum-agent-install (verify channel name) |
 
 ## How Backups Work
 
@@ -73,6 +74,8 @@ Resources are backed up in two categories:
 **How to exclude a resource:** Add label `velero.io/exclude-from-backup: "true"`
 
 **Note:** Secrets used by Hive `ClusterDeployment` are auto-labeled when created via the console UI. If created via GitOps, the `cluster.open-cluster-management.io/backup` label must be added manually.
+
+**Known gap (ACM-38831, confirmed 2026-07-28, not yet fixed):** Secrets referenced by `ClusterDeployment.Spec.CertificateBundles[].CertificateSecretRef.Name` (customer-provided custom API/ingress TLS certs) are NOT backed up. They're user-created, so Hive never applies `hive.openshift.io/secret-type` to them, and no code in this repo labels them either — checked every labeling path in `pre_backup.go` (`updateHiveResources`, `updateAISecrets`, `updateMetalSecrets`), none touch `CertificateBundle`. See [`incidents/afaulhab-certificatebundles-infraenv-2026-07-28.md`](incidents/afaulhab-certificatebundles-infraenv-2026-07-28.md) for the full writeup and proposed fix (`updateCertificateBundleSecrets()`).
 
 ## BackupSchedule Phases
 
@@ -520,6 +523,27 @@ See the [OADP Version Compatibility](#oadp-version-compatibility) table above.
 ### 15. "`local-cluster` settings not restored"
 **Category:** Expected behavior
 Settings for the `local-cluster` managed cluster resource (such as owning managed cluster set) are not backed up or restored because they contain cluster-specific information. Any customizations to `local-cluster` on the primary hub must be manually applied on the restored hub.
+
+### 15b. "certificateBundles secrets and InfraEnv webhook rejection during incremental hub migration" (ACM-38831, ACM-38832)
+**Category:** ACM-38831 = confirmed cluster-backup-operator bug (fixable here). ACM-38832 = assisted-service/Infrastructure Operator design limitation (not fixable in this repo).
+**Reporter:** afaulhab, July 2026, discovered while migrating clusters one-at-a-time between two independent ACM hubs (see issue #10b).
+
+**ACM-38831 — `ClusterDeployment.Spec.CertificateBundles[].CertificateSecretRef` secrets never get a backup label:**
+- These are customer-provided secrets (custom API/ingress TLS certs) that Hive only *references*, it doesn't create/manage them, so they never get `hive.openshift.io/secret-type`.
+- Confirmed via full-repo search: no code anywhere labels these secrets with `cluster.open-cluster-management.io/backup` either.
+- Result: silently excluded from every backup; missing entirely after restore (Hive will surface `ControlPlaneCertificateNotFoundCondition`/`IngressCertificateNotFoundCondition`).
+- **Fix:** add `updateCertificateBundleSecrets()` in `pre_backup.go` (same pattern as `updateAISecrets`/`updateMetalSecrets`) — walk `ClusterDeployment.Spec.CertificateBundles[].CertificateSecretRef.Name` and label the referenced secret.
+- **Workaround until fixed:** manually add `cluster.open-cluster-management.io/backup: ""` to any secret referenced by `certificateBundles`.
+
+**ACM-38832 — InfraEnv restore fails `infraenvvalidators.admission.agentinstall.openshift.io` webhook when both `spec.ClusterRef` and `spec.OSImageVersion` are set:**
+- This combination is a legitimate end-state (add a worker node after an OS upgrade — see upstream assisted-service docs), reachable only via an **Update** to an existing InfraEnv.
+- The webhook's **Create**-path unconditionally rejects this combination — no exception for restore scenarios. A Velero restore onto a new hub is a Create from the target API server's perspective, so it always hits this rejection.
+- Verified upstream in `openshift/assisted-service` (PR #5569, commit 36d3543, PR #8818) — this is by design in the webhook, not a bug in our restore logic, and not fixable from this repo.
+- No bypass-label mechanism exists for this webhook (contrast with Hive's own `hive.openshift.io/disable-creation-webhook-for-dr`, which `updateHiveResources()` in `pre_backup.go` patches onto ClusterDeployments to skip an analogous Hive creation-webhook check).
+- **This needs a fix in `assisted-service` / Infrastructure Operator (MGMT) team** — e.g. a bypass label the webhook honors, or detecting restore context (`velero.io/backup-name` label) and relaxing the check.
+- **No workaround known yet** other than manually recreating the InfraEnv without both fields set, then re-adding `osImageVersion` via Update after the referenced ClusterDeployment is confirmed `Installed` on the new hub.
+
+**Full investigation, code references, and upstream links:** [`incidents/afaulhab-certificatebundles-infraenv-2026-07-28.md`](incidents/afaulhab-certificatebundles-infraenv-2026-07-28.md)
 
 ## Cluster Role Assessment
 
