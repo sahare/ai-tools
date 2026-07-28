@@ -3,7 +3,7 @@
 **Date investigated:** 2026-07-28
 **Customer/reporter:** afaulhab (Slack, migrating clusters one-at-a-time from an old hub to a new hub)
 **Investigator:** sahare, code-level investigation in `cluster-backup-operator` + upstream `assisted-service` research (no live cluster access for this one — desk investigation only)
-**Status:** Root cause confirmed for both at the code/design level. ACM-38831 is fixable in this repo. ACM-38832 requires a fix in `assisted-service` (Infrastructure Operator / MGMT team).
+**Status:** Root cause confirmed for both at the code/design level. ACM-38831 resolved as **expected behavior** per QE feedback (2026-07-28) — see update at bottom. ACM-38832 requires a fix in `assisted-service` (Infrastructure Operator / MGMT team).
 
 ## Customer's original report (verbatim, condensed)
 
@@ -75,16 +75,36 @@ I checked every code path in `pre_backup.go` that grants the `cluster.open-clust
 
 Net effect: the secret is silently excluded from every backup, and on restore the referenced secret simply doesn't exist on the new hub. Hive will report a condition like `ControlPlaneCertificateNotFoundCondition` / `IngressCertificateNotFoundCondition` (both exist as named conditions in the Hive API — confirmed in the same types file) once it notices the secret is missing.
 
-### Proposed fix
+### Proposed fix (drafted, then reverted — see QE update below)
 
-Add a new function analogous to `updateAISecrets`/`updateMetalSecrets`, e.g. `updateCertificateBundleSecrets()`, called from the same place `updateHiveResources()` is called (`pre_backup.go`):
+Added a new function analogous to `updateAISecrets`/`updateMetalSecrets`, `updateCertificateBundleSecrets()`, called from the same place `updateHiveResources()` is called (`pre_backup.go`):
 
 1. List all `ClusterDeployment`s
 2. For each, iterate `Spec.CertificateBundles[]`
 3. For each bundle, `c.Get()` the secret named `CertificateSecretRef.Name` in the ClusterDeployment's namespace
 4. If found, call `updateSecret(ctx, c, secret, backupCredsClusterLabel, "certificatebundle", true)` — same helper already used by the other two functions, which is careful not to stomp on labels if one of the three qualifying labels is already present
 
-This is a small, self-contained change, no new API dependency needed (already importing `hivev1`).
+This was a small, self-contained change (no new API dependency needed, already importing `hivev1`), compiled and unit-tested successfully. **Not merged** — see resolution below.
+
+### UPDATE 2026-07-28 — QE feedback, resolved as expected behavior
+
+Before merging the fix above, raised the design question with QE via Jira comment on ACM-38831: should we auto-detect and label these secrets (like assisted-install/metal3), or treat them as user-provided data requiring a manual label (like GitOps-created Hive admin-kubeconfig secrets)?
+
+**QE's response (verbatim):**
+
+> "the Hive CertificateBundles allow users to define custom certificate chains in a ClusterDeployment resource to inject trusted CAs into provisioned target clusters, hence those referenced secrets would be categorized as user-provided data and be handled manually. The same approach would be applied to other user custom data as well (such as manifestsConfigMapRef/manifestsSecretRef)."
+
+**Decision: do NOT auto-detect.** Treat `certificateBundles`-referenced secrets the same as any other user-provided data — require the manual `cluster.open-cluster-management.io/backup` label, same as the documented GitOps-created-Hive-secret case. The same reasoning extends to `ClusterDeployment.Spec.ManifestsConfigMapRef`/`ManifestsSecretRef` (and by extension `SSHPrivateKeySecretRef`) — none of these should be auto-labeled by the operator; they're all first-class "bring your own resource" fields where the user is expected to know the resource needs the backup label, same as any other custom resource per the "How to include custom resources" guidance.
+
+**Reasoning this holds up:**
+- Consistent with the one existing precedent we already have for this exact category (GitOps Hive secrets — manual label required).
+- Avoids coupling `cluster-backup-operator` to Hive's CRD internals for an open-ended, growing list of "reference to user secret" fields — `certificateBundles` today, `manifestsConfigMapRef`/`manifestsSecretRef`/`sshPrivateKeySecretRef` tomorrow. Auto-detecting one and not the others would just be inconsistent in the other direction.
+- The drafted fix (`updateCertificateBundleSecrets()`) was reverted, not committed.
+
+**Action items:**
+- ACM-38831 should be resolved as "working as intended" / documentation gap, not a code defect.
+- Recommend adding an explicit doc callout (README / business continuity guide) naming `certificateBundles`, `manifestsConfigMapRef`, and `manifestsSecretRef` secrets/configmaps as requiring the manual backup label — today's docs only call out the GitOps-kubeconfig case, not these.
+- Customer-facing guidance: manually label the secrets referenced by these three fields with `cluster.open-cluster-management.io/backup: ""`.
 
 ---
 
@@ -142,10 +162,12 @@ Either fix has to land upstream in `assisted-service` / with the Infrastructure 
 - [x] Confirmed the Create-vs-Update distinction in the webhook and why restore lands in the stricter Create path
 - [x] Confirmed no code in `cluster-backup-operator` touches `CertificateBundle` secrets or InfraEnv fields today
 - [x] Identified the existing `hive_label` bypass precedent as the template for a possible InfraEnv-side fix
-- [ ] Not yet done: live repro on a real assisted-service-backed cluster (this investigation was desk/code-only, no cluster access)
-- [ ] Not yet done: confirm with Infrastructure Operator/MGMT team whether they'd accept a bypass-label approach or prefer detecting restore context another way
-- [ ] Not yet done: implement + test the `updateCertificateBundleSecrets()` fix for ACM-38831 in this repo
+- [x] Drafted, compiled, and unit-tested the `updateCertificateBundleSecrets()` fix for ACM-38831 — reverted after QE feedback (see update above)
+- [x] Got QE input on ACM-38831 design question — resolved as expected/manual-label behavior, not a code bug
+- [ ] Not yet done: live repro on a real assisted-service-backed cluster for ACM-38832 (this investigation was desk/code-only, no cluster access)
+- [ ] Not yet done: confirm with Infrastructure Operator/MGMT team whether they'd accept a bypass-label approach or prefer detecting restore context another way for ACM-38832
+- [ ] Not yet done: doc update naming `certificateBundles`/`manifestsConfigMapRef`/`manifestsSecretRef` as requiring manual backup labels
 
 ## Suggested short customer-facing summary
 
-ACM-38831 (certificateBundles secrets) is a real gap in cluster-backup-operator, we can fix it. ACM-38832 (InfraEnv webhook) is a design limitation in the assisted-service admission webhook, not something cluster-backup-operator can fix directly — needs to go to the Infrastructure Operator/MGMT team.
+ACM-38831 (certificateBundles secrets) is expected behavior per QE — these are user-provided data (like `manifestsConfigMapRef`/`manifestsSecretRef`), so the referenced secret needs the `cluster.open-cluster-management.io/backup` label added manually, same as other custom/GitOps-created resources. ACM-38832 (InfraEnv webhook) is a design limitation in the assisted-service admission webhook, not something cluster-backup-operator can fix directly — needs to go to the Infrastructure Operator/MGMT team.
