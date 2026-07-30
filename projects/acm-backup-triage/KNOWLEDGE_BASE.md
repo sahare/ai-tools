@@ -749,6 +749,31 @@ When a customer issue looks like a potential bug, ask for:
 9. **Events:** `oc get events -n open-cluster-management-backup --sort-by='.lastTimestamp'`
 10. **Policy status:** `oc get policy backup-restore-enabled -n open-cluster-management-backup -o yaml`
 
+## Security Finding / Embargo Breach Escalation Process
+
+If a security fix branch or PR containing an embargoed finding is accidentally opened in a
+**public** repo (even briefly, even if closed immediately), the diff is still fetchable via the
+GitHub API/URL — closing or deleting the PR does not remove exposure. Only a GitHub Support
+takedown request removes it, and that requires immediate ProdSec involvement. Treat this as an
+active incident, not a cleanup task: report it to ProdSec right away rather than trying to fix it
+via further git operations (force-push, history rewrite, etc. do not help once GitHub has served
+the content).
+
+**Severity gates the follow-up process, not the initial escalation:**
+
+- Report the breach to ProdSec immediately regardless of severity — this step doesn't change.
+- If no CVE has been filed yet for the finding, an **unembargoed** CVE gets created (since the
+  exposure already broke any embargo, there's nothing left to protect), and you work it through
+  the normal process with your ProdSec contact.
+- **Critical-severity findings get an extra verification + reporting step:** double-check the
+  severity is accurate, and once a CVE is created, proactively report the CVE ID and due date up
+  the chain (not just to your direct ProdSec contact).
+- **Important/Moderate/Low findings** follow the default path — work directly with your ProdSec
+  contact, no extra up-the-chain due-date reporting required.
+
+Don't assume every accidental exposure needs executive-level escalation — check the assigned
+severity first before over- or under-reacting.
+
 ## Useful Links
 
 - **Official docs:** https://docs.redhat.com/en/documentation/red_hat_advanced_cluster_management_for_kubernetes/2.16/html/business_continuity/index
