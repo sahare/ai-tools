@@ -749,6 +749,44 @@ When a customer issue looks like a potential bug, ask for:
 9. **Events:** `oc get events -n open-cluster-management-backup --sort-by='.lastTimestamp'`
 10. **Policy status:** `oc get policy backup-restore-enabled -n open-cluster-management-backup -o yaml`
 
+## Standard CVE Fix Workflow (Business Continuity → Sustaining Admins)
+
+This is the normal (non-breach) process for handling an embargoed security finding end-to-end, per
+the team's CVE workflow onboarding (Jira: ACM-35024).
+
+**While under embargo — private mirror is the staging ground:**
+
+1. All fix development, code review, and cross-stream validation happens in the team's **private
+   mirror repo**, not the public repo. Nothing embargoed goes into a public repo or public PR
+   before the embargo lifts.
+2. Develop and validate the fix on `main` first, then backport (cherry-pick, resolving conflicts as
+   needed) to every affected z-stream release branch, opening one PR per branch in the private
+   mirror. Build + run the relevant unit tests on every branch before opening its PR.
+3. Get the private-mirror PRs reviewed and approved, but **hold off on merging** them until the
+   embargo lift date is confirmed — merging early doesn't help since none of it can go public yet,
+   and premature merges just create more branches to keep in sync if the embargo timeline shifts.
+
+**Business Continuity team's job stops at `main`.** The team does **not** manually backport fixes
+into the public z-stream release branches — that's owned by `ocp-sustaining-admins`.
+
+**Once the embargo lifts:**
+
+1. Merge the fix to the **public `main`** branch only.
+2. For each affected z-stream, add a comment to that stream's Jira ticket linking the public
+   `main` PR and summarizing backport context: confirm there are no breaking changes, and note
+   that a pre-tested backport already exists and was validated in the private mirror (so
+   sustaining admins aren't starting from scratch).
+3. Reassign each per-stream Jira ticket to `ocp-sustaining-admins`. They own actually opening and
+   merging the backport PRs into the public, otherwise-closed/frozen z-stream release branches.
+4. Sustaining admins bypass normal branch protection on those frozen branches using the
+   **`acknowledge-security-fixes-only`** GitHub label — a label reserved specifically for
+   security-only fixes, so it doesn't reopen the branch to general changes.
+
+**Why pre-validate in the private mirror before handoff:** by the time sustaining admins pick up
+the per-stream ticket, they can trust the diff is a known-good, build-and-test-verified backport
+rather than re-doing that verification themselves under the embargo's disclosure SLA time
+pressure.
+
 ## Security Finding / Embargo Breach Escalation Process
 
 If a security fix branch or PR containing an embargoed finding is accidentally opened in a
