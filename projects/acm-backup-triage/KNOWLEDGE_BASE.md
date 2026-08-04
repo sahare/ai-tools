@@ -75,7 +75,10 @@ Resources are backed up in two categories:
 
 **Note:** Secrets used by Hive `ClusterDeployment` are auto-labeled when created via the console UI. If created via GitOps, the `cluster.open-cluster-management.io/backup` label must be added manually.
 
-**ACM-38831 — resolved as expected behavior, not a bug (QE-confirmed 2026-07-28):** Secrets referenced by `ClusterDeployment.Spec.CertificateBundles[].CertificateSecretRef.Name` (customer-provided custom API/ingress TLS certs) are NOT backed up automatically, and this is **by design**, per QE feedback: these are **user-provided data** (custom CA/cert chains the user injects into the ClusterDeployment), same category as other user-supplied Hive references like `manifestsConfigMapRef`/`manifestsSecretRef` (and by the same logic, `sshPrivateKeySecretRef`). QE's guidance: handle all of these the same way — manual labeling — rather than having the operator auto-detect and label them. A code fix was drafted (walk `Spec.CertificateBundles` and auto-label the referenced secret, mirroring `updateAISecrets`/`updateMetalSecrets`) but was **not merged**, to stay consistent with how we already treat GitOps-created Hive secrets (manual label required) and with QE's stated preference. **Action for customers:** manually add `cluster.open-cluster-management.io/backup: ""` to any secret referenced by `certificateBundles`, `manifestsConfigMapRef`, or `manifestsSecretRef`. See [`incidents/afaulhab-certificatebundles-infraenv-2026-07-28.md`](incidents/afaulhab-certificatebundles-infraenv-2026-07-28.md) for the full writeup, the drafted-then-reverted fix, and QE's reasoning.
+**ACM-38831 — UPDATE 2026-08-04: reversed again, now fixed in code (was "expected behavior" per QE 2026-07-28, team lead overrode that and asked for the fix):** Secrets/configmaps referenced by name off a `ClusterDeployment` are now auto-labeled for backup in `updateHiveReferencedSecrets()` (`pre_backup.go`), covering `Spec.CertificateBundles[].CertificateSecretRef`, `Spec.PullSecretRef`, and `Spec.Provisioning.ManifestsSecretRef`/`ManifestsConfigMapRef`. Rationale for the reversal: these references are all discoverable directly off a resource we already back up (the ClusterDeployment itself), unlike truly-external user data — QE's "handle it like other user-provided data" argument was judged less important than closing a silent-data-loss gap. `Spec.BoundServiceAccountSigningKeySecretRef` was deliberately left OUT (private AWS STS signing key material — different risk profile than a cert bundle, open question raised with the team rather than auto-labeled). PR: [stolostron/cluster-backup-operator#1684](https://github.com/stolostron/cluster-backup-operator/pull/1684).
+- **CodeRabbit caught a real gap during review:** the fix's `local-cluster` exclusion (added because `updateHiveResources` must never label `local-cluster`'s resources for backup — restoring them corrupts the target hub) only guarded the `ClusterDeployment` loop. The **separate, pre-existing `ClusterPool` loop** in the same function had no such guard — a `ClusterPool` sitting in the `local-cluster` namespace would still get its namespace's secrets labeled. Fixed by reusing the already-resolved `localClusterName` variable in that loop too, with a regression test. **General lesson:** when `local-cluster` needs to be excluded from a function, audit *every* loop/branch in that function, not just the one you're actively touching — the exclusion doesn't automatically propagate.
+- Also fixed while implementing: `updateHiveResources` now fails closed (skips the whole reconcile cycle) if resolving `localClusterName` itself errors, rather than defaulting to an empty string that would silently bypass the exclusion check.
+- **Prior "expected behavior" guidance below (customer-facing manual-label workaround) is now superseded for the three fields above** — they no longer need manual labeling once this PR ships. Manual labeling is still required for anything NOT in that list (e.g. `sshPrivateKeySecretRef`, `BoundServiceAccountSigningKeySecretRef`, GitOps-created Hive admin-kubeconfig secrets).
 
 ## BackupSchedule Phases
 
@@ -528,15 +531,14 @@ Settings for the `local-cluster` managed cluster resource (such as owning manage
 **Category:** ACM-38831 = confirmed cluster-backup-operator bug (fixable here). ACM-38832 = assisted-service/Infrastructure Operator design limitation (not fixable in this repo).
 **Reporter:** afaulhab, July 2026, discovered while migrating clusters one-at-a-time between two independent ACM hubs (see issue #10b).
 
-**ACM-38831 — `ClusterDeployment.Spec.CertificateBundles[].CertificateSecretRef` secrets never get a backup label — RESOLVED AS EXPECTED BEHAVIOR (QE-confirmed 2026-07-28):**
-- These are customer-provided secrets (custom API/ingress TLS certs) that Hive only *references*, it doesn't create/manage them, so they never get `hive.openshift.io/secret-type`.
-- Confirmed via full-repo search: no code anywhere labels these secrets with `cluster.open-cluster-management.io/backup` either.
-- Result: silently excluded from every backup; missing entirely after restore (Hive will surface `ControlPlaneCertificateNotFoundCondition`/`IngressCertificateNotFoundCondition`).
-- **A code fix was drafted** (`updateCertificateBundleSecrets()` in `pre_backup.go`, same pattern as `updateAISecrets`/`updateMetalSecrets` — walk `ClusterDeployment.Spec.CertificateBundles[].CertificateSecretRef.Name` and label the referenced secret) — compiled, unit-tested, all green.
-- **QE feedback (2026-07-28) — decided NOT to merge the auto-detect fix:** "the Hive CertificateBundles allow users to define custom certificate chains in a ClusterDeployment resource to inject trusted CAs into provisioned target clusters, hence those referenced secrets would be categorized as user-provided data and be handled manually. The same approach would be applied to other user custom data as well (such as `manifestsConfigMapRef`/`manifestsSecretRef`)."
-- **Rationale for going with manual-label over auto-detect:** consistent with the existing precedent for GitOps-created Hive admin-kubeconfig/admin-password secrets (also manual-label-required, not auto-detected); avoids coupling `cluster-backup-operator` to Hive's CRD schema for every possible user-data-reference field (`certificateBundles` today, `manifestsConfigMapRef`/`manifestsSecretRef`/`sshPrivateKeySecretRef` tomorrow — an ever-growing list if we auto-detect one-by-one).
-- **Correct customer-facing guidance:** manually add `cluster.open-cluster-management.io/backup: ""` to any secret/configmap referenced by `certificateBundles`, `manifestsConfigMapRef`, or `manifestsSecretRef` on a `ClusterDeployment`. This should be added to official docs as a named example under "how to include custom resources," since it's not obvious from the field names alone that these need separate labeling.
-- **Status:** Jira should be resolved as "working as intended" / doc gap, not a code bug. The drafted code fix was reverted (not committed) per QE's guidance.
+**ACM-38831 — `ClusterDeployment`-referenced secrets never get a backup label — history: "expected behavior" (QE, 2026-07-28) → REVERSED, now fixed in code (team lead, 2026-08-04):**
+- These are customer-provided secrets (custom API/ingress TLS certs, pull secrets, manifest overrides) that Hive only *references*, it doesn't create/manage them, so they never get `hive.openshift.io/secret-type`.
+- Result before the fix: silently excluded from every backup; missing entirely after restore (Hive will surface `ControlPlaneCertificateNotFoundCondition`/`IngressCertificateNotFoundCondition` for the cert-bundle case).
+- **First pass (2026-07-28):** a code fix was drafted (walk `Spec.CertificateBundles` and label the referenced secret, mirroring `updateAISecrets`/`updateMetalSecrets`), compiled and unit-tested clean, but QE argued these are user-provided data that should be manually labeled like other user-supplied Hive references (`manifestsConfigMapRef`/`manifestsSecretRef`) — fix was reverted, ticket was going to be resolved as "working as intended."
+- **Second pass (2026-08-04):** team lead reconsidered and asked for the fix after all — closing a silent-data-loss gap outweighed the "handle it like other user data" consistency argument, especially since (unlike truly external user data) these references are discoverable directly off a resource we already back up. **Implemented and merged into the fix:** `Spec.CertificateBundles[].CertificateSecretRef`, `Spec.PullSecretRef`, `Spec.Provisioning.ManifestsSecretRef`/`ManifestsConfigMapRef`, in `updateHiveReferencedSecrets()` (`pre_backup.go`). **Deliberately excluded:** `BoundServiceAccountSigningKeySecretRef` (private AWS STS token-signing key material — different risk profile, raised as an open question with the team rather than silently auto-labeled).
+- **PR:** [stolostron/cluster-backup-operator#1684](https://github.com/stolostron/cluster-backup-operator/pull/1684).
+- **Correct customer-facing guidance now:** `certificateBundles`, `pullSecretRef`, and `manifestsSecretRef`/`manifestsConfigMapRef` referenced secrets/configmaps are auto-labeled — no manual action needed once this PR ships. Still-manual: anything not in that list, e.g. `sshPrivateKeySecretRef`, `BoundServiceAccountSigningKeySecretRef`, GitOps-created Hive admin-kubeconfig secrets.
+- **Bug caught in review (CodeRabbit) — general lesson, not just this PR:** the `local-cluster` exclusion added alongside this fix only covered the `ClusterDeployment` loop in `updateHiveResources`; a separate, pre-existing `ClusterPool` loop in the same function had no equivalent guard, so a `ClusterPool` in the `local-cluster` namespace would still get its namespace's secrets labeled for backup. When adding a `local-cluster` exclusion to a function with multiple independent loops/branches, audit *all* of them — the guard doesn't propagate automatically. Also hardened: the function now fails closed (skips the cycle) if resolving `localClusterName` itself errors, instead of silently treating an unresolved name as "no exclusion needed."
 
 **ACM-38832 — InfraEnv restore fails `infraenvvalidators.admission.agentinstall.openshift.io` webhook when both `spec.ClusterRef` and `spec.OSImageVersion` are set:**
 - This combination is a legitimate end-state (add a worker node after an OS upgrade — see upstream assisted-service docs), reachable only via an **Update** to an existing InfraEnv.
@@ -786,6 +788,68 @@ into the public z-stream release branches — that's owned by `ocp-sustaining-ad
 the per-stream ticket, they can trust the diff is a known-good, build-and-test-verified backport
 rather than re-doing that verification themselves under the embargo's disclosure SLA time
 pressure.
+
+## CI / Prow Infrastructure Notes (openshift/release)
+
+### SonarCloud reporting 0.0% coverage on new code despite tests passing
+**Symptom:** `ci/prow/sonar` and `sonar-post-submit` pass (Quality Gate green), but the SonarCloud
+dashboard shows 0.0% coverage on new code — masking real coverage regressions, since the gate
+doesn't fail on this.
+
+**Root cause:** a stale/corrupted Go build cache inside the `sonar` step's container causes the
+`controllers` package's test binary to fail compiling with errors like `could not import os` /
+`reflect` / `context`. When that compile fails, Sonar has no coverage data for the package and
+reports 0%, but the step doesn't hard-fail overall.
+
+**Not unique to this repo:** `insights-client` and `insights-metrics` hit the identical symptom and
+root cause; fixed in [openshift/release#82513](https://github.com/openshift/release/pull/82513) by
+adding `go clean -cache -modcache` immediately before the `sonar/go/prow` make target in both the
+`sonar` and `sonar-post-submit` steps.
+
+**Fix applied to cluster-backup-operator:** same one-line addition, applied to `main` and all 9
+release-branch CI configs (2.11–2.17, 5.0, 5.1) in
+[openshift/release#82909](https://github.com/openshift/release/pull/82909), since this is a
+CI-infra issue, not branch-specific. No Prow job regeneration was needed — the generated job specs
+under `ci-operator/jobs/` just invoke `ci-operator --target=sonar`, which reads the `commands:`
+block from the config file at runtime.
+
+**If this recurs on another stolostron Go repo:** check for the same `go clean -cache -modcache`
+line in that repo's `sonar`/`sonar-post-submit` steps before assuming it's a new issue.
+
+### `main` → release-branch fast-forwarding: history and current state (cluster-backup-operator)
+**Current state (as of Aug 2026): fast-forwarding is NOT configured at all** for
+`cluster-backup-operator` in `openshift/release` — no `fast-forward` / `ocm-ci-fastforward` job
+exists in any of its CI config files. `CONTRIBUTING.md`/repo docs describing an ongoing "main
+fast-forwards to the current release branch" post-submit behavior are **stale** as of this
+finding.
+
+**History:** [openshift/release#78276](https://github.com/openshift/release/pull/78276) ("ACM
+business continuity - remove ffwding from main->release-2.17", merged Apr 23 2026) explicitly
+removed the `fast-forward` postsubmit job (workflow `ocm-ci-fastforward`, `DESTINATION_BRANCH:
+release-2.17`) from `cluster-backup-operator`'s `main.yaml` — and did the identical removal for
+`volsync-addon-controller` in the same PR. It was never re-added for `release-5.0`/`release-5.1`.
+
+**How to tell if a release branch is being actively fast-forwarded vs. just freshly cut:** compare
+its HEAD commit SHA to `main`'s (`git ls-remote --heads <repo-url>`). `release-2.14` through
+`release-2.17` have all diverged from `main` (expected — actively maintained z-streams, no ffwd).
+`release-5.0`/`release-5.1` are currently identical to `main` — not because of an active sync
+mechanism, just because no fast-forward job exists to diverge them from, and nothing has been
+backported to them yet since they were cut.
+
+**Takeaway for future branch-cut tickets (e.g. ACM-39278-style "branching day" tasks):** don't
+assume a fast-forward job exists just because docs/tribal knowledge say so — check the actual
+`ci-operator/config/stolostron/<repo>/*.yaml` files directly. If a "disable fast-forwarding before
+freeze" warning shows up again, first confirm one is even configured before doing anything.
+
+### ACM 5.1 branching day (ACM-39278) — config was pre-created ahead of the actual cut
+`stolostron-cluster-backup-operator-release-5.1.yaml` and branch protection for `release-5.1` were
+both added proactively in
+[openshift/release#78583](https://github.com/openshift/release/pull/78583) ("ACM business
+continuity 5.0 and 5.1 release branch config"), well ahead of the Aug 6 2026 feature-freeze date,
+mirroring the `release-5.0` config with `promotion.disabled: true` on the branch-specific config
+while `main.yaml` promotes images to both the `5.0` and `5.1` imagestream namespaces. This is the
+expected "holding pattern" pattern before a freeze actually takes hold — useful as a template for
+the next branch cut (e.g. 5.2).
 
 ## Security Finding / Embargo Breach Escalation Process
 
