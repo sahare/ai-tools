@@ -1325,7 +1325,35 @@ resource — it appends an `ActionInclude` entry to `excludeRules`, which the ma
 after any prior `ActionExclude` for the same group/kind. Without registering the include, the
 collector would still exclude resources that an integration team intended to collect.
 
-### Additional CodeRabbit/Sonar fixes applied to PR #757 (Jul 16 2026)
+### jlpadilla's review feedback (Jul 29-30 2026) — addressed in PR #757
+
+1. **Names shortened** — removed redundant `-collector-config` suffix from all 7 config names:
+   `cnv-integration-collector-config` → `cnv-integration`, `olm-integration-collector-config` →
+   `olm-integration`, etc. Full list: `cnv-integration`, `olm-integration`, `grc-integration`,
+   `kyverno-integration`, `gatekeeper-integration`, `argo-integration`, `app-lifecycle-integration`.
+
+2. **Namespace removed from YAMLs** — the hardcoded `namespace: open-cluster-management` was
+   silently ignored (the seeder always uses `owner.Namespace`). Removed to avoid confusing
+   integration team contributors. QE uses `ocm` as their deploy namespace, confirming why
+   this needed to be dynamic.
+
+3. **Manual-override annotation (Option 4)** — if a user annotates an integration CollectorConfig
+   with `search.open-cluster-management.io/manual-override`, the seeder skips it entirely. Edits
+   survive restarts without needing a differently-named config. This was the outcome of a design
+   discussion where jlpadilla raised the UX concern that unpredictable pod restarts would silently
+   wipe user customizations. The annotation makes the overwrite behavior predictable and
+   user-controlled. Constant: `AnnotationManualOverride` in `api/v1alpha1/collectorconfig_types.go`.
+
+4. **Labels fully merged on update** — the update path now merges ALL labels from the shipped YAML
+   (not just `IntegrationTeamLabel`), so if someone removes the backup label from a live config,
+   the seeder restores it on the next restart. Create and Update are now symmetric.
+
+5. **Copyright headers** — added to all 7 YAML files.
+
+6. **Architecture doc trimmed** — removed verbose debugging narrative about the WATCH_NAMESPACE
+   bug discovery; kept only the essential fact ("namespace is discovered from the Search CR").
+
+### Additional CodeRabbit/Sonar/CI fixes applied to PR #757 (Jul 16 2026)
 
 - **Missing integration label reconciliation**: a pre-existing canonical config without
   `IntegrationTeamLabel` is now relabeled on update — both the webhook's exclude-overlap check
@@ -1337,8 +1365,10 @@ collector would still exclude resources that an integration team intended to col
   namespace if duplicates exist.
 - **Dockerfile.rhtap fix**: Konflux builds from a separate `Dockerfile.rhtap` (not the plain
   `Dockerfile`). It was missing `COPY config/ config/`, causing `go mod vendor` to fail.
-- **Lint timeout**: bumped `golangci-lint --timeout` from 3m to 8m in both `Makefile` and
-  `Makefile.prow` — the codebase outgrew the old deadline on CI hardware.
+- **Lint timeout**: `Makefile.prow` (CI) bumped from 3m to 5m — the codebase outgrew the old
+  deadline on CI hardware (golangci-lint v2.9.0 reports "0 issues" then times out). Local
+  `Makefile` stays at 3m since developer machines are faster. Root cause: cumulative growth from
+  Go 1.26, crypto bump, TLS profile, and SCC PRs — not specific to this PR.
 
 ---
 
