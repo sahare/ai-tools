@@ -736,6 +736,116 @@ oc logs -n open-cluster-management-backup -l app=cluster-backup-chart-clusterbac
   - **Go/No-Go criteria before DR:** All ClusterDeployments have preserveOnDelete=true, credentials validated, ArgoCD sync pause automated, manual recovery steps documented.
 **Case reference:** #04440443 (Amadeus)
 
+### 21. "BareMetalHost stuck in Inspecting after DR / ClusterInstance restored when it shouldn't be" (ACM-39330)
+**Category:** Confirmed cluster-backup-operator gap, fix delivered (partial), fixed in code.
+**Reporter:** Sunny, Aug 2026 — ZTP/bare-metal fleet with passive-sync DR.
+
+**Symptom:** `BareMetalHost` objects for already-installed ZTP clusters flip back to `Inspecting`
+state after a DR failover, or even just during routine passive-sync cycles with no real failover.
+
+**A hypothesis worth ruling out fast, not chasing:** singular vs. plural resource name in
+`Restore.spec.restoreStatus.includedResources` (e.g. `BareMetalHost` vs `baremetalhosts`) is **not**
+the cause — Velero's RESTMapper matches singular/plural case-insensitively, and that field only
+controls `.status` subresource restoration, not object creation. Don't spend time on resource-name
+casing for this class of bug.
+
+**Real root cause:** `ClusterInstance` (`siteconfig.open-cluster-management.io`) drives Day-1
+manifest rendering (including `BareMetalHost`) on every SiteConfig controller reconcile. Before the
+fix, `ClusterInstance` was restored **unconditionally** via `acm-resources-schedule` — not
+activation-gated like `agent-install.openshift.io` resources — so it got restored/updated even
+during passive sync (`veleroManagedClustersBackupName: skip`), with no failover happening at all,
+triggering unwanted Day-1 re-renders.
+
+**Fix (Exposure #1 — passive-sync, DONE):** added `siteconfig.open-cluster-management.io` to
+`includedActivationAPIGroupsByName` (`controllers/backup.go`), routing `ClusterInstance` into the
+managed-clusters activation tier. Now it's only restored during a real failover (`latest`), same as
+`agent-install.openshift.io` resources. PR: [#1685](https://github.com/stolostron/cluster-backup-operator/pull/1685)
+(merged to `main`), cherry-picked to `release-2.17` as [#1687](https://github.com/stolostron/cluster-backup-operator/pull/1687).
+
+**NOT yet fixed (Exposure #2 — failover-ordering):** even during a *real* failover, `ClusterInstance`
+has no restore-order priority and Velero doesn't restore `.status` by default, so SiteConfig can
+still race ahead of `BareMetalHost` and re-trigger Day-1 rendering. Needs SiteConfig/ZTP team input
+— flagged on the Jira, response pending.
+
+**Backport status / OCP-version gotcha:** merging to `main` + cherry-picking to `release-2.17`
+does NOT automatically help every affected customer — always check the customer's actual OCP
+version against that ACM release's support matrix first. A customer on an older OCP version (e.g.
+4.18) needs the fix in whichever ACM release actually supports that OCP version (e.g. 2.14/2.15),
+not necessarily the newest release branch.
+
+**Manual workaround (use with caution, not reversible):**
+```bash
+oc patch clusterinstance <name> -n <ns> --type merge -p '{"spec":{"suppressedManifests":["BareMetalHost"]}}'
+oc patch bmh <name> -n <ns> --type merge -p '{"spec":{"externallyProvisioned":true}}'
+```
+`suppressedManifests` and `externallyProvisioned` are both real fields — but `externallyProvisioned:
+true` is **not reversible** (confirmed against upstream metal3 docs/issue) once set. Apply
+`suppressedManifests` first, check existing values before overwriting (merge patches replace list
+fields wholesale), and only use `externallyProvisioned` as a last resort if impact is severe —
+otherwise wait for the real fix.
+
+**Full writeup:** [`incidents/sunny-clusterinstance-bmh-inspecting-2026-08-05.md`](incidents/sunny-clusterinstance-bmh-inspecting-2026-08-05.md)
+(also has the `openshift-cherrypick-robot` multi-branch gotcha and EUS/support-matrix backport
+reasoning — see [Backport Branch Selection Policy](#backport-branch-selection-policy-which-release-branches-to-target) below).
+
+### 22. "Can we use a third-party backup tool (e.g. Kasten) instead of OADP/Velero for the hub?"
+**Category:** Not supported — architectural, not just a support-matrix gap.
+**Answer: no, with high confidence.** `cluster-backup-operator` is deeply integrated with Velero's
+own CRDs and mechanics, not just "a backup tool that happens to be OADP":
+- Backup/restore selection logic (`backup.go`, activation-tier gating) is expressed as Velero
+  `Schedule`/`Backup`/`Restore` label selectors and `includedResources`/`excludedResources` — a
+  different backup engine has no equivalent selector model to plug into.
+- Activation semantics (passive vs. managed-clusters activation, `CleanupRestored`/`CleanupAll`,
+  sync mode) are implemented as controller logic that creates and watches Velero `Restore` objects
+  directly — there's no abstraction layer a third-party tool could sit behind.
+- Safety exclusions (`local-cluster`, MCH namespace, excluded API groups/CRDs) are enforced at the
+  point resources are handed to Velero for backup — reimplementing this outside our controller
+  would require duplicating a large, actively-changing amount of business logic with no upstream
+  support if it drifts.
+- There is no supported "manual reintegration" path (e.g., recreating cluster connections via
+  bootstrap-kubeconfig by hand after a non-Velero restore) — this bypasses the activation
+  controller entirely and isn't a documented or tested procedure.
+**No official written "not supported" statement exists for this specific question** (Kasten wasn't
+named in any doc found) — the confidence here comes from the architecture, not a citation.
+
+## Backport Branch Selection Policy — which release branches to target
+When a fix needs backporting beyond the branch it merged to, don't backport to every existing
+release branch reflexively. Reasoning to apply:
+- **Fully-supported window ("current + 2 previous"):** routine bug backports here need no special
+  justification — open a normal cherry-pick PR. (At time of writing: 2.15/2.16/2.17.)
+- **EUS releases** (currently 2.11 and 2.13) get a **longer** support tail, but backports still
+  need the same "real need + urgent priority" justification/sign-off process used for other EUS
+  backport requests (see [Standard CVE Fix Workflow](#standard-cve-fix-workflow-business-continuity--sustaining-admins)
+  for the analogous embargo process) — don't open these PRs preemptively without that sign-off, it
+  can undercut the process release management asked to be followed.
+- **Non-EUS branches outside the current+2 window** (e.g., an older EUS's *predecessor* generation)
+  have ambiguous support-phase status — low-cost to attempt (a normal cherry-pick PR) but not
+  guaranteed to be accepted by OWNERS; don't assume acceptance.
+- **Always cross-check the customer's actual OCP version against the target ACM release's support
+  matrix** before telling anyone a backport "will help them" — a newer-sounding ACM release branch
+  is not automatically the one that supports an older customer's OCP version.
+- **Tooling gotcha:** `openshift-cherrypick-robot` processes a multi-branch `/cherry-pick a b c`
+  comment sequentially and **stops at the first branch that fails to apply** — it does not attempt
+  the remaining branches in that same request. If you only see one bot reply after requesting
+  several branches, assume the rest were never attempted (not that they silently succeeded) and
+  either re-request them individually or cherry-pick manually.
+
+## Code Review Process Notes
+
+### CodeRabbit flagging a concern on a cherry-pick PR that it didn't flag on the original PR
+Observed on `release-2.17`'s cherry-pick ([#1687](https://github.com/stolostron/cluster-backup-operator/pull/1687))
+of [#1685](https://github.com/stolostron/cluster-backup-operator/pull/1685): CodeRabbit flagged
+`processResourcesToBackup` mutating a package-level slice (`backupManagedClusterResources`) as a
+concurrency concern on the cherry-pick, but said nothing about the identical code on the original
+PR. Investigated whether the two PRs' diffs actually differed (they didn't, functionally) —
+concluded this is LLM non-determinism in the review tool itself, not a real difference in the code
+being reviewed. **Before spending time hardening code in response to a review comment, check
+whether the same code already went through review unflagged elsewhere** — if so, and the concern
+isn't actually reachable in practice (e.g., here: the controller runs single-threaded,
+`MaxConcurrentReconciles` is unset/defaults to 1, and only one caller invokes the function), it's
+reasonable to resolve the comment with an explanation rather than a code change, and note it as a
+possible future hardening item rather than a blocking issue.
+
 ## Information to Collect for Bug Reports
 
 When a customer issue looks like a potential bug, ask for:
