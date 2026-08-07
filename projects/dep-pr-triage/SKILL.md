@@ -78,6 +78,26 @@ Read the output for:
   now. `DIRTY`/`BLOCKED` → hold.
 - Checks — **every** check must be a pass. Any failure → hold. Any still-`pending`/`in_progress` →
   don't approve yet, this isn't a "no" but it isn't a "yes" either; re-check later.
+- **When something fails, read the actual failure log before writing your recommendation — never
+  guess or speculate that it's "probably unrelated CI flakiness."** Pull the real log (e.g. via the
+  Prow build-log URL from `gh pr checks`, typically
+  `https://storage.googleapis.com/test-platform-results/pr-logs/pull/<org>_<repo>/<pr>/<job>/<id>/build-log.txt`)
+  and find the actual compiler/linter/test error. Two failure modes are common and easy to
+  misdiagnose as "flaky" if you only look at the pass/fail summary:
+  - **Coordinated-bump breaks**: a bot bumps one dependency (e.g. `k8s.io/client-go`) without a
+    compatible bump of a tightly-coupled one (e.g. `sigs.k8s.io/controller-runtime`), producing a
+    genuine compile error. Diff the full `go.mod`/`go.sum` change (not just the file list) —
+    "digest"-titled or single-package-titled bumps from bots (Renovate/mintmaker/Konflux) often
+    drag in several transitive version bumps at once, and any one of them can be the actual culprit
+    even if the PR title only mentions one package.
+  - **Newly-surfaced deprecations under a zero-tolerance lint gate**: a transitive bump adds a
+    `// Deprecated:` doc comment to something already in use (e.g. `staticcheck`'s `SA1019`), and a
+    strict `make lint` fails the whole PR over it. This is a real, fixable issue in the target
+    repo's source, not noise.
+  - **Incomplete bot output**: `go.mod` updated but `go.sum` wasn't regenerated ("missing go.sum
+    entry" errors) — a malformed PR, not a code compatibility problem.
+  Your report should name the specific root cause (with the offending file/line where you found
+  one), not just "CI is failing."
 - Changed files — must be limited to dependency manifest/lock files: `go.mod`, `go.sum`,
   `package.json`, `package-lock.json`, `yarn.lock`, `pnpm-lock.yaml`, `requirements*.txt`,
   `Pipfile.lock`, `vendor/**`, `Gopkg.lock`, or CI/build config files the bot conventionally
