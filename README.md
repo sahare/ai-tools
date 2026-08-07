@@ -22,6 +22,7 @@ Instead of reading docs and running commands manually, just tell your AI assista
 | [acm-backup-triage](projects/acm-backup-triage/) | AI-powered triage for customer backup/restore issues | ~15-30 min per triage |
 | [acm-cluster-setup](projects/acm-cluster-setup/) | Automated ACM dev build installation with AI-powered diagnostics | ~30 min per install |
 | [acm-release-cut](projects/acm-release-cut/) | Automated CI config changes for new ACM release branches | ~2 hours per release cut |
+| [dep-pr-triage](projects/dep-pr-triage/) | Triage Dependabot/Renovate PRs on any repo — check CI, mergeability, bump risk, approve the safe ones | ~5-10 min per PR |
 
 ## Getting Started
 
