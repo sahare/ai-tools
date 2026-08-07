@@ -4,31 +4,41 @@ description: >-
   Triage open dependency-bump PRs (Dependabot/Renovate) for a given repo:
   verify CI is green, the PR is mergeable, the diff is scoped to
   dependency-manifest files only, and the version bump is not a risky major
-  version. Approve safe PRs directly (as the agent, via gh pr review), and
-  leave a clear explanatory comment on anything held for human review. Use
-  only when explicitly asked to triage/review dependency PRs for a repo -
-  this performs real GitHub actions (approvals, comments), so do not
-  auto-invoke ambiently.
+  version. Two rounds: round 1 is read-only and ends with a report and a
+  recommendation per PR (no approvals or comments posted); round 2 only runs
+  after the human explicitly confirms, and then approves the recommended PRs
+  directly (as the agent, via gh pr review) or leaves an explanatory comment
+  on anything held. Use only when explicitly asked to triage/review
+  dependency PRs for a repo - this performs real GitHub actions, so do not
+  auto-invoke ambiently and never skip straight to round 2.
 disable-model-invocation: true
 ---
 
 # Dependency PR Triage
 
 One-word workflow: given a repo, find dependency-bump PRs, decide safe-vs-risky per PR using the
-checklist below, and act — approve the safe ones yourself, hold the risky ones with an explanation.
-This is a consequential-action skill (it approves PRs under your own `gh` identity) — always follow
-the checklist in full before approving, and when in doubt, hold rather than approve.
+checklist below, and report the recommendation. **This is always a two-round process — never
+approve or comment on anything during round 1.** Round 1 is read-only: list, check, classify,
+recommend, and stop at the report. Only in round 2, after the human explicitly says to proceed
+(e.g. "approve", "approve #123 and #456", "approve all recommended"), do you actually call
+`approve.sh` / `hold.sh`. This is a consequential-action skill (it approves PRs under your own `gh`
+identity) — never skip straight to acting on a fresh invocation, even if every PR looks obviously
+safe.
 
 ## Workflow
 
 ```
 Task progress (copy and track per repo):
+Round 1 (read-only):
 - [ ] Step 1: List candidate PRs
 - [ ] Step 2: Check this repo's approval mechanism (once per repo, not per PR)
 - [ ] Step 3: Per PR — gather status
 - [ ] Step 4: Per PR — classify the bump
-- [ ] Step 5: Per PR — decide: approve or hold
-- [ ] Step 6: Report a summary table
+- [ ] Step 5: Per PR — recommend: approve or hold (do NOT act yet)
+- [ ] Step 6: Report a summary table and stop; wait for explicit go-ahead
+
+Round 2 (only after explicit human confirmation):
+- [ ] Step 7: Act on exactly what was confirmed
 ```
 
 ### Step 1 — List candidates
@@ -91,25 +101,40 @@ Parse the "from X to Y" (or "to vY") version(s) out of the PR title/body:
 - Minor and patch bumps of already-1.0+ packages, with everything else in Step 3 passing → safe to
   approve.
 
-### Step 5 — Decide and act
+### Step 5 — Recommend (do NOT act yet)
 
-**All of these must hold to approve:** CI green (not pending/failing), `mergeStateStatus: CLEAN`,
-diff scoped to dependency files only, not a major/risky bump per Step 4.
+**All of these must hold for a "recommend approve":** CI green (not pending/failing),
+`mergeStateStatus: CLEAN`, diff scoped to dependency files only, not a major/risky bump per Step 4.
+Anything else is "recommend hold" (or "not ready — CI/mergeability still pending, re-check later"
+if nothing has actually failed, it just isn't done yet).
 
-If approving:
+For each recommendation, draft — but do not yet post or run — the exact text/command you'd use in
+Step 7:
+- Recommend approve → draft the `approve.sh` call and the audit-trail body you'd pass it, e.g.
+  *"Automated dependency-triage approval: CI green (N checks), mergeable/clean, minor bump
+  (1.4.0 → 1.4.3), diff limited to go.mod/go.sum. No source changes."* Note whether `--also-lgtm`
+  is needed per Step 2.
+- Recommend hold → draft the `hold.sh` call and reason, naming the specific failing check, the
+  major-version jump, or the unexpected file.
+
+### Step 6 — Report and stop
+
+End with a table: PR number | title | **recommendation** (approve/hold/not-ready) | one-line reason
+| draft comment/approval text. Then stop. Do not call `approve.sh` or `hold.sh` in this round under
+any circumstances, even if every single PR looks like a trivial patch bump — the human reviews the
+report and tells you which ones (if any) to act on.
+
+### Step 7 — Act (round 2 only, after explicit confirmation)
+
+Only enter this step once the human has responded with something like "approve", "approve #123 and
+#456", "approve all recommended", or "hold #789 instead, approve the rest". Act on exactly what was
+confirmed — if they say "approve all recommended", that means only the ones you marked
+recommend-approve in Step 6, not every PR in the list.
+
 ```bash
-scripts/approve.sh <owner/repo> <pr-number> "<summary of what was checked>" [--also-lgtm]
+scripts/approve.sh <owner/repo> <pr-number> "<audit-trail body from Step 5>" [--also-lgtm]
+scripts/hold.sh    <owner/repo> <pr-number> "<reason from Step 5>"
 ```
-Write the approval body as a real audit trail, e.g.: *"Automated dependency-triage approval: CI
-green (N checks), mergeable/clean, minor bump (1.4.0 → 1.4.3), diff limited to go.mod/go.sum. No
-source changes."* Add `--also-lgtm` only if Step 2 said this repo needs it.
-
-If holding:
-```bash
-scripts/hold.sh <owner/repo> <pr-number> "<what's blocking and why>"
-```
-Be specific — name the failing check, the major-version jump, or the unexpected file — so a human
-reviewer doesn't have to redo your triage from scratch.
 
 **Never do any of the following, even if it seems like it would "help":**
 - Don't force-push, rebase, or push commits to the PR branch yourself.
@@ -118,12 +143,11 @@ reviewer doesn't have to redo your triage from scratch.
 - Don't approve a PR with any failing required check, even if you believe the failure is unrelated
   flakiness — flag that belief in a hold comment instead and let a human make that call.
 - Don't approve drafts, or PRs with an explicit hold/do-not-merge label.
+- Don't silently expand scope beyond what was confirmed (e.g. don't also hold-comment on PRs the
+  human didn't mention).
 
-### Step 6 — Report
-
-End with a table: PR number | title | decision (approved/held/skipped-pending) | one-line reason.
-This is the artifact a human skims to sanity-check what you did — make it complete even for PRs you
-didn't touch (e.g. "still running CI, re-check next pass").
+Confirm back to the human what was actually done (which PRs got `approve.sh`, which got `hold.sh`,
+which were left untouched) once round 2 finishes.
 
 ## Invoking this for a new repo
 
