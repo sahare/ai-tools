@@ -16,6 +16,20 @@ disable-model-invocation: true
 
 # Dependency PR Triage
 
+## Example invocations
+
+`disable-model-invocation` is set, so this skill only loads when you name it (or something close
+to it) explicitly — it will not trigger just because a message mentions PRs or dependencies.
+
+**Round 1 (scan/report, read-only):**
+> `dep-pr-triage <owner/repo>`
+> `dep-pr-triage stolostron/cluster-backup-operator: scan for bot-opened dependency PRs, check green/mergeable, and if not green say whether it's intermittent or a real problem with the bump`
+
+**Round 2 (act, same conversation, after reviewing the report):**
+> `approve` (all recommend-approve PRs from the report)
+> `approve #1683`
+> `approve #1683 and #1681, hold the rest`
+
 One-word workflow: given a repo, find dependency-bump PRs, decide safe-vs-risky per PR using the
 checklist below, and report the recommendation. **This is always a two-round process — never
 approve or comment on anything during round 1.** Round 1 is read-only: list, check, classify,
