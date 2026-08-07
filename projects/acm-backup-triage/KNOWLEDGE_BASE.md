@@ -899,6 +899,47 @@ the per-stream ticket, they can trust the diff is a known-good, build-and-test-v
 rather than re-doing that verification themselves under the embargo's disclosure SLA time
 pressure.
 
+## Security Fix Verification Methodology
+
+General, reusable process for validating a security fix before it goes public — developed while
+verifying a batch of embargoed fixes ahead of their public-PR green light. No CVE-specific details
+here by design; see the team's private/local embargo tracking for those.
+
+**Don't just trust that a fix was reviewed before — re-derive it from the code:**
+1. Read the actual pre-fix vulnerable code path yourself and confirm it matches the vulnerability's
+   description. Don't assume a written summary is accurate without checking it against `main`.
+2. Review the fix's diff for completeness (does it close the *whole* vulnerable surface, or just
+   the reported instance of it?) and check for an accompanying regression test that fails on the
+   old code and passes on the new code.
+3. Build and run tests **per fix, in isolation**, not just as part of a combined branch — isolates
+   which fix (if any) is actually responsible for a failure.
+4. If multiple fixes are landing around the same time (e.g., a batch of CVEs against the same
+   component), **merge them all together locally and re-run the full test suite against the
+   combined result**, including the slower integration/envtest suite, not just unit tests. Fixes
+   that pass individually can still conflict or interact badly once combined — checking this before
+   they land publicly is much cheaper than discovering it after.
+5. Run the linter against the combined result too, matching CI's exact config — a passing build
+   with lint violations still blocks or delays the public PR.
+
+**Classify every fix by *failure mode*, not just correctness — this determines what needs a release
+note:**
+- **Fails loud:** the fix rejects the now-blocked input/configuration with a clear, actionable error
+  or status message (e.g., an admission webhook rejection, or a reconciler status message telling
+  the user what changed and what to do). Customers relying on the old (vulnerable) behavior find
+  out immediately, with a path to remediate.
+- **Fails silent:** the fix makes a previously-effective, previously-documented field or option
+  quietly stop doing anything, with no error and no indication to the user. This is the pattern to
+  actively watch for: check whether the field/option being closed off is mentioned anywhere in
+  docs, sample YAMLs, or a CRD's field-level comments. If it is, **flag it for an explicit release
+  note / KCS callout** regardless of how correct the fix is — otherwise the first sign of the change
+  will be a confused "this stopped working" support ticket days or weeks after the fix ships,
+  looking like a mystery regression instead of an intentional, documented security change.
+
+**Practical takeaway:** a fix being "correct" (closes the vulnerability, doesn't break tests) and a
+fix being "safe to ship without a heads-up" are two different bars. Always evaluate both before
+signing off on a security fix, and call out any silent-failure-mode fixes explicitly when handing
+off for release-note authoring.
+
 ## CI / Prow Infrastructure Notes (openshift/release)
 
 ### SonarCloud reporting 0.0% coverage on new code despite tests passing
