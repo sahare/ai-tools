@@ -9,19 +9,36 @@ description: >-
   embargoed-security-fix verification/backport process for this component.
   Use when diagnosing a customer-reported ACM backup or restore problem,
   planning or reviewing a DR runbook, answering "why wasn't X restored",
-  assessing a cluster's active/passive role, or verifying a
-  cluster-backup-operator security fix before it ships.
+  assessing a cluster's active/passive role, verifying a
+  cluster-backup-operator security fix before it ships, or implementing
+  code changes to this operator.
 ---
 
 # ACM Backup & Restore Triage
 
 Companion knowledge base for the `cluster-backup-operator` (ACM hub disaster recovery). Built from
 real customer cases, code-verified root-cause investigations, and this component's release/CVE
-process — not just documentation. Full detail lives in [KNOWLEDGE_BASE.md](KNOWLEDGE_BASE.md);
-this file is the fast-path entry point.
+process — not just documentation. Full detail lives in the linked files below; this file is the
+fast-path entry point.
 
 **Repo:** https://github.com/stolostron/cluster-backup-operator | **Docs:**
 https://docs.redhat.com/en/documentation/red_hat_advanced_cluster_management_for_kubernetes/2.16/html/business_continuity/index
+
+## Progressive Disclosure — Read Only What You Need
+
+This skill uses a **layered approach** to minimize token consumption. Start here, then read only
+the specific deep-dive file needed for your task:
+
+| Task Type | Read This File | Token Cost |
+|-----------|---------------|------------|
+| **Quick ownership/routing check** | This file (below) | ~500 tokens |
+| **Customer issue diagnosis** | [INVESTIGATION_PLAYBOOKS.md](INVESTIGATION_PLAYBOOKS.md) | ~2k tokens |
+| **Deep issue details / root cause** | [KNOWLEDGE_BASE.md](KNOWLEDGE_BASE.md) (specific section) | ~1-3k tokens per section |
+| **Code change / bug fix** | [CODE_MAP.md](CODE_MAP.md) | ~3k tokens |
+| **Full incident reconstruction** | [incidents/](incidents/) (specific file) | ~2-5k tokens |
+
+**Rule:** Never read KNOWLEDGE_BASE.md end-to-end. Use the issue index below to jump to the
+specific section, or use INVESTIGATION_PLAYBOOKS.md to identify which section you need.
 
 ## Ownership routing — check this before investigating
 
@@ -36,100 +53,63 @@ https://docs.redhat.com/en/documentation/red_hat_advanced_cluster_management_for
 
 ## CRITICAL RULES — never violate these
 
-1. **NEVER recommend deleting ManagedClusters from any hub before or during a restore.** Restore
-   handles reconciliation; deletion while `Available` destroys spoke workloads. Use
-   `disable-auto-import` (or `ImportOnly` strategy) instead — it prevents split-brain without
-   deleting anything.
-2. **When reviewing a customer DR playbook**, diff every step against the official documented
-   procedure. Flag any deviation, especially deletions/detachments not in the docs.
-3. Only delete ManagedClusters from the old hub if: restore is fully complete on the new hub,
-   clusters show `Unknown` on the old hub, and you don't plan to fail back to it.
-4. Docs explicitly say: "If you want to restore the data to the backup after your recovery test
-   completes, skip cleaning the resources."
-5. **`cleanupBeforeRestore` defaults to the safest option.** Partial/incremental migrations or
-   "move managed clusters" → always `None`. Never recommend `CleanupAll` without extreme
-   justification.
-6. For repeated "move managed clusters" operations, re-running the cheap/safe policies+apps+creds
-   step (`cleanupBeforeRestore: None`) is low-risk; skipping it risks missing new policies.
-7. Recommend excluding `open-cluster-management-agent`/`-agent-addon` namespaces from
-   cross-hub restores as a safeguard, even though their secrets typically lack backup labels.
+1. **NEVER recommend deleting ManagedClusters from any hub before or during a restore.**
+2. **When reviewing a customer DR playbook**, diff every step against the official documented procedure.
+3. **`cleanupBeforeRestore` defaults to the safest option.** Use `None` for migrations.
+4. **Never recommend `CleanupAll` without extreme justification.**
 
 ## Quick lookup
 
-**BackupSchedule phases:** New → Enabled (healthy) | FailedValidation (bad config) | Failed
-(internal error) | BackupCollision (another hub owns latest backups) | Paused
+**BackupSchedule phases:** New → Enabled (healthy) | FailedValidation | Failed | BackupCollision | Paused
 
-**Restore phases:** Started → Running → Finished (done) | FinishedWithErrors (partial failure) |
-Error (hard failure) | Enabled (passive sync active, `syncRestoreWithNewBackups`)
+**Restore phases:** Started → Running → Finished | FinishedWithErrors | Error | Enabled (passive sync)
 
-**`cleanupBeforeRestore`:** `None` (additive, safe default for migrations) | `CleanupRestored`
-(removes prior-restore leftovers, standard active/passive) | `CleanupAll` (removes everything
-matching backup criteria — use with extreme caution)
-
-**A non-paused BackupSchedule and an active Restore cannot coexist.** Only one active Restore at a
-time (active = any phase except Finished/FinishedWithErrors).
-
-Full tables, `restoreStatus`/label reference, OADP version matrix, and the ImportOnly strategy →
-[KNOWLEDGE_BASE.md](KNOWLEDGE_BASE.md#backupschedule-phases).
+**`cleanupBeforeRestore`:** `None` (safe) | `CleanupRestored` (standard) | `CleanupAll` (dangerous)
 
 ## Issue index — jump straight to the fix
 
-Each maps to a numbered entry in [KNOWLEDGE_BASE.md](KNOWLEDGE_BASE.md) with full root cause,
-diagnostics, and resolution steps.
+Each maps to a section in [KNOWLEDGE_BASE.md](KNOWLEDGE_BASE.md):
 
 | # | Symptom |
 |---|---|
-| 1 | Restore stuck in `Error` after a temporary BSL outage — doesn't auto-recover |
-| 2 | BackupSchedule in `BackupCollision` |
-| 3 | BackupSchedule in `FailedValidation` |
-| 4 | Restore in `FinishedWithErrors` |
-| 5 | Managed clusters not reconnecting after restore — **includes the full MSA/auto-import-secret failback failure analysis** (SA-UID invalidation, ownerRef bug, 2.14 vs 2.15+ code differences) |
+| 1 | Restore stuck in Error after BSL outage |
+| 2 | BackupSchedule in BackupCollision |
+| 3 | BackupSchedule in FailedValidation |
+| 4 | Restore in FinishedWithErrors |
+| 5 | Managed clusters not reconnecting (MSA/auto-import, failback SA-UID invalidation) |
 | 6 | "What gets backed up? My resource X is not restored" |
-| 7 | Velero pod OOM / restore taking too long — scale tuning |
-| 8 | How to set up active/passive hub clusters |
+| 7 | Velero pod OOM / restore too long |
+| 8 | Active/passive setup guide |
 | 9 | OADP version compatibility |
-| 10 | Moving managed clusters between two non-identical hubs (NOT a standard restore) |
+| 10 | Moving managed clusters between non-identical hubs |
 | 10b | Incremental/repeated single-cluster migration |
-| 11 | Primary hub still running, want to move clusters to a new hub |
-| 12 | Application data backup on managed clusters — **out of scope**, use OADP/Velero policies |
-| 13 | Restore validation webhook rejection (sync mode rules) |
-| 14 | Cross-datacenter DR with separate S3 buckets per site |
-| 15 | `local-cluster` settings not restored — expected |
-| 15b | `certificateBundles`/Hive-referenced secrets and InfraEnv webhook rejection during incremental migration (ACM-38831/38832) |
-| 16 | BareMetal / ClusterInstance clusters and DR, BMH backup requirements |
-| 17 | `oadp-hdr-app-install` community policy — out of scope, different from hub backup |
-| 18 | ArgoCD managing ManagedCluster CRs causes split-brain during DR cleanup |
-| 19 | Hive ClusterDeployments stuck `Deleting` after DR — stale cloud credentials |
-| 20 | DR at scale — guidance for large fleets (70-137+ clusters) |
-| 21 | BareMetalHost stuck in `Inspecting` after DR — ClusterInstance not activation-gated (ACM-39330) |
-| 22 | Third-party backup tools (e.g. Kasten) instead of OADP/Velero — **not supported** |
+| 11 | Primary hub still running, want to move clusters |
+| 12 | Application data backup on managed clusters (out of scope) |
+| 13 | Restore webhook rejection (sync mode rules) |
+| 14 | Cross-datacenter DR with separate S3 |
+| 15 | local-cluster settings not restored (expected) |
+| 15b | certificateBundles/InfraEnv webhook rejection (ACM-38831/38832) |
+| 16 | BareMetal / ClusterInstance clusters and DR |
+| 17 | oadp-hdr-app-install community policy (out of scope) |
+| 18 | ArgoCD managing ManagedCluster CRs causes split-brain |
+| 19 | Hive ClusterDeployments stuck Deleting (stale cloud creds) |
+| 20 | DR at scale (70-137+ clusters) |
+| 21 | BareMetalHost stuck Inspecting after DR (ACM-39330) |
+| 22 | Third-party backup tools (e.g. Kasten) — NOT supported |
 
-**Not in the index above?** Check [Cluster Role Assessment](KNOWLEDGE_BASE.md#cluster-role-assessment)
-for diagnosing active/passive/collision state from scratch, or the governance policy template table
-if a `backup-restore-enabled` policy is `NonCompliant`.
+## Process references
 
-## Process references (not customer triage, but same domain)
-
-- [Security Fix Verification Methodology](KNOWLEDGE_BASE.md#security-fix-verification-methodology) —
-  how to independently verify a security fix (loud vs. silent failure-mode classification) before
-  it ships.
-- [Standard CVE Fix Workflow](KNOWLEDGE_BASE.md#standard-cve-fix-workflow-business-continuity--sustaining-admins) —
-  private-mirror staging → main → sustaining-admin handoff process.
-- [Backport Branch Selection Policy](KNOWLEDGE_BASE.md#backport-branch-selection-policy-which-release-branches-to-target) —
-  which release branches actually need a given fix (current+2 vs. EUS vs. OCP support matrix).
-- [CI / Prow Infrastructure Notes](KNOWLEDGE_BASE.md#ci--prow-infrastructure-notes-openshiftrelease) —
-  known `openshift/release` config gotchas for this repo (Sonar coverage, fast-forwarding).
+- [Security Fix Verification](KNOWLEDGE_BASE.md#security-fix-verification-methodology)
+- [CVE Fix Workflow](KNOWLEDGE_BASE.md#standard-cve-fix-workflow-business-continuity--sustaining-admins)
+- [Backport Branch Selection](KNOWLEDGE_BASE.md#backport-branch-selection-policy-which-release-branches-to-target)
+- [CI / Prow Notes](KNOWLEDGE_BASE.md#ci--prow-infrastructure-notes-openshiftrelease)
 
 ## Deep-dive incident writeups
 
-For full command-by-command investigations behind the summarized findings above, see
-[incidents/](incidents/). Each is a standalone record (cluster access may no longer be available)
-covering root cause, live diagnostics, and the exact reasoning trail — useful when a similar case
-recurs and the summary in KNOWLEDGE_BASE.md isn't detailed enough.
+[incidents/](incidents/) — standalone records with command-by-command investigation trails.
 
-## When collecting info for a new/unclear issue
+## Information to collect for new/unclear issues
 
-Before triaging anything not covered above, gather: ACM version, OCP version, OADP version,
-BackupSchedule/Restore YAML + status, Velero backup/restore status, BSL status, operator + Velero
-pod logs, recent events, and `backup-restore-enabled` policy status. Commands for each →
-[Information to Collect for Bug Reports](KNOWLEDGE_BASE.md#information-to-collect-for-bug-reports).
+Before triaging, gather: ACM version, OCP version, OADP version, BackupSchedule/Restore YAML +
+status, Velero backup/restore status, BSL status, operator + Velero pod logs, recent events,
+policy status. Full command list → [INVESTIGATION_PLAYBOOKS.md](INVESTIGATION_PLAYBOOKS.md#information-collection-template).
