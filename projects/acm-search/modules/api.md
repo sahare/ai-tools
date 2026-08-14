@@ -8,7 +8,34 @@
 
 GraphQL API server that queries PostgreSQL with per-user RBAC filtering. Supports search, autocomplete, schema introspection, related resources, and WebSocket subscriptions.
 
-## GraphQL Schema (`graph/schema.graphqls`)
+## Architecture
+
+```
+main.go
+ → config.Cfg.Validate()
+ → database.GetConnPool(ctx) — Postgres pool
+ → rbac.GetCache().StartBackgroundValidation(ctx) — watches NS + ManagedClusters
+ → server.StartAndListen(ctx) — HTTPS :4010
+```
+
+### HTTP Routes
+| Path | Auth | Purpose |
+|------|------|---------|
+| `GET /liveness` | no | Always OK |
+| `GET /readiness` | no | Always OK (no DB check) |
+| `GET /metrics` | no | Prometheus |
+| `POST /federated` | TokenReview only | Cross-hub search (if feature on) |
+| `{CONTEXT_PATH}/graphql` | full middleware | GraphQL + WebSocket |
+| `/playground` | no | gqlgen playground if `PLAYGROUND_MODE` |
+
+### Middleware order on `/searchapi`
+1. TimeoutHandler (skip WebSocket)
+2. PrometheusMiddleware (skip WebSocket)
+3. CheckDBAvailability — 503 if pool unhealthy
+4. AuthenticateUser — TokenReview
+5. AuthorizeUser — populate shared + user RBAC caches
+
+## GraphQL Schema
 
 | Operation | Signature | Description |
 |-----------|-----------|-------------|
@@ -24,124 +51,150 @@ GraphQL API server that queries PostgreSQL with per-user RBAC filtering. Support
 |-------|------|-------|
 | keywords | [String] | Full-text across all properties. Multiple = AND. |
 | filters | [SearchFilter] | property + values. Multiple filters = AND, values = OR. |
-| filters values operators | prefix | `=, !, !=, >, >=, <, <=`. Datetime: `hour/day/week/month/year`. Wildcard: `*` |
-| limit | Int | Default 10000. -1 = no limit. |
+| limit | Int | Default from `QUERY_LIMIT` (1000). -1 = no limit. |
 | offset | Int | Pagination. |
 | orderBy | String | `'property asc/desc'` |
 | relatedKinds | [String] | Filter related resource kinds. |
 
-## Package Map
+### Filter Value Operators
+Prefix on values: `=`, `!`, `!=`, `<`, `<=`, `>`, `>=`
+Wildcards: `*` → SQL `%` (LIKE)
+Timestamps: `hour|day|week|month|year` → relative ISO timestamps
+`kind`: case-insensitive ILIKE if value starts with lowercase
 
-| Package | Purpose | Key files |
-|---------|---------|-----------|
-| `graph/` | GraphQL schema, gqlgen generated code, resolvers | `schema.graphqls`, `resolver.go` |
-| `pkg/resolver` | Query building, RBAC WHERE clauses, related resources | `search.go`, `searchHelper.go`, `rbacHelper.go`, `related.go` |
-| `pkg/rbac` | User data building (SSAR/SSRR), caching, watch | `userData.go`, `cache.go`, `watchCache.go`, `sharedData.go` |
-| `pkg/database` | PostgreSQL connection, LISTEN/NOTIFY | `connection.go`, `listener.go`, `listenerTrigger.sql` |
-| `pkg/federated` | Global/federated search fan-out to managed hubs | `federated.go`, `fedConfig.go` |
-| `pkg/server` | HTTP router, middleware | `server.go` |
-| `pkg/config` | Configuration | `config.go` |
+## SQL Query Builder (`pkg/resolver/`)
 
-## SQL Query Builder (`pkg/resolver/search.go` + `searchHelper.go`)
-
-Built with the `goqu` library. Filter → SQL mapping:
+Built with `goqu` library. Table: `search.resources` (uid, cluster, data JSONB).
 
 | Input | SQL Pattern |
 |-------|-------------|
 | `kind: pod` (lowercase) | `data->>'kind' ILIKE ANY ('{"pod"}')` |
 | `name: nginx-*` (wildcard) | `data->>'name' LIKE 'nginx-%'` |
 | `label: app=nginx` | `data->'label' @> '{"app":"nginx"}'` |
-| `label: app=*` (wildcard value) | `EXISTS(SELECT 1 FROM jsonb_each_text(data->'label') WHERE key LIKE 'app' AND value LIKE '%')` |
 | `created: hour` (datetime) | `data->>'created' > '<1h ago>'` |
-| `status: Running` | `data->'status' ? 'Running'` |
-| `replicas: >3` (numeric) | `(data->'replicas')::numeric > 3` |
 | `cluster: local-cluster` | `cluster = 'local-cluster'` (column, not JSONB) |
 | keywords | `FROM search.resources, jsonb_each_text(data) WHERE value ILIKE '%keyword%'` |
+| unknown property | `1=0` (zero rows silently — not error) |
 
-## RBAC Pipeline (7 steps)
+## RBAC System (`pkg/rbac/`)
 
-1. **Extract token** — `Authorization: Bearer` header
-2. **Validate token** — `TokenReview` → username + groups + UID. Cached 60s.
-3. **Check cluster-admin** — SSAR `verb=* resource=*`. If yes → no WHERE clause.
-4. **Check global hub user** — SSAR for `searches/allManagedData` get.
-5. **Build namespace RBAC** — parallel `SelfSubjectRulesReview` per namespace → `(apigroup, kind)` tuples.
-6. **Build cluster-scope RBAC** — parallel SSAR per cluster-scoped resource.
-7. **Fine-grained RBAC** (if enabled) — `userpermissions.clusterview` CRD.
+### AuthN Flow
+1. Cookie `acm-access-token-cookie` OR `Authorization: Bearer …`
+2. `TokenReviews().Create` (cached `AUTH_CACHE_TTL` 60s)
+3. Invalid → 403; missing → 401; API error → 500
 
-## RBAC WHERE Clause (`pkg/resolver/rbacHelper.go`)
+### AuthZ / UserData Build (keyed by TokenReview UID)
 
+**Fast path — `userHasAllAccess`:**
+1. SSAR: `list * *` → cluster-admin: empty WHERE clause (sees everything)
+2. Else SSAR: `get searches/allManagedData` → global search SA (managed data only)
+
+**Normal path:**
+1. Optional: list `userpermissions.clusterview` (fine-grained)
+2. For each hub namespace: SSRR (`oc auth can-i --list -n X`) → collect resources with verb `list`/`*`
+3. Managed cluster access = `create managedclusterviews` in view API group
+4. Parallel SSAR for hub cluster-scoped resources
+
+### RBAC WHERE Clause (`rbacHelper.go`)
 ```sql
 WHERE (hub_branch OR managed_cluster_branch)
 ```
+- **Hub:** `_hubClusterResource` present AND (cluster-scoped OR namespace apigroup/kind matches)
+- **Managed (basic):** `cluster = ANY(allowed)` or `cluster != (hub)` if wildcard
+- **Fine-grained:** cluster+namespace+apigroup/kind bindings from UserPermission CRs
 
-- **Hub branch:** `data?'_hubClusterResource' AND (cluster-scoped OR namespace-scoped check)`
-- **Managed cluster branch:** `cluster = ANY(ARRAY[...])` for clusters user has ManagedClusterView access
-
-### Namespace Consolidation Optimization
-
-Namespaces with identical resource access are grouped:
-```sql
-data->'namespace' ?| ARRAY['ns-a','ns-b','ns-c'] AND (kind/apigroup check)
-```
-Dramatically reduces query size for users with many namespaces.
-
-## RBAC Cache
-
-- Keyed by user UID (from TokenReview)
-- TokenReview cache: 60s TTL per token
-- UserData cache: `UserCacheTTL` (default 10 min)
-- Session affinity via ClusterIP (no shared cache needed)
-- Background watcher invalidates on Role/ClusterRole/RoleBinding/Namespace/CRD changes
+### Cache Invalidation (partial!)
+- Watches NS/ManagedCluster: ADDED/DELETED events refresh shared + per-user SSRR
+- Does **NOT** watch Role/RoleBinding/ClusterRole — permission changes wait for `USER_CACHE_TTL` expiry (5 min default)
 
 ## Related Resources (`pkg/resolver/related.go`)
 
-Recursive CTE traversing `search.edges`:
+Recursive CTE on `search.edges`:
 - Level 1 (default): direct neighbors
 - Level 3: for Application queries (3-hop)
-- Excluded from recursion: Node, Channel (too many results)
+- Excluded from recursion: Node, Channel (too many connections)
 - RBAC applied to final JOIN
+- Synthetic `cluster__<name>` nodes added for cluster association
 
-## WebSocket Subscriptions (`pkg/resolver/watchSubscription.go`)
+## WebSocket Subscriptions
 
-- PostgreSQL `LISTEN/NOTIFY` trigger on `search.resources` changes
-- Listener goroutine applies RBAC and pushes to matching WebSocket subscribers
+- PostgreSQL `LISTEN search_resources_notify` trigger
+- Payload truncated >~7000 bytes → backfill via SELECT
+- Per-event RBAC check via SSAR `watch` verb
+- Max active: `SUBSCRIPTION_MAX_ACTIVE` (200); lifetime 12h; idle 1h
 
 ## Federated Search (`pkg/federated/`)
 
-Enabled when `FEATURE_FEDERATED_SEARCH=true`. Proxies queries to all managed hub search-APIs in parallel. Responses merged and deduplicated. Supports `managedHub` filter.
+Enabled when `FEATURE_FEDERATED_SEARCH=true`. Fan-out to managed hubs:
+- Local: same-cluster GraphQL endpoint with caller token
+- Remotes: ManagedClusters with `hub.open-cluster-management.io` claim; token from Secret `search-global`
+- Merge: schema/complete/items/related combined; `managedHub` stamped on items
+- No global LIMIT/SORT across hubs
 
 ## Environment Variables
 
-| Variable | Description |
-|----------|-------------|
-| DB_HOST, DB_PORT, DB_USER, DB_PASS, DB_NAME | PostgreSQL connection |
-| FEATURE_FEDERATED_SEARCH | Enable global search |
-| FEATURE_FINE_GRAINED_RBAC | Enable fine-grained RBAC |
-| HUB_NAME | Hub cluster name |
-| USER_CACHE_TTL_MS | RBAC cache TTL (default 600000 = 10 min) |
-| QUERY_LIMIT | Default result limit (10000) |
-| RELATION_LEVEL | Default recursion depth for related |
+| Variable | Default | Description |
+|----------|---------|-------------|
+| DB_HOST/PORT/USER/PASS/NAME | | PostgreSQL connection |
+| QUERY_LIMIT | 1000 | Default result limit |
+| AUTH_CACHE_TTL | 60s | TokenReview cache |
+| SHARED_CACHE_TTL | 5 min | Namespaces, ManagedClusters |
+| USER_CACHE_TTL | 5 min | Per-user SSRR/SSAR |
+| USER_PERMISSION_CACHE_TTL | 30s | Fine-grained UserPermissions |
+| FEATURE_FEDERATED_SEARCH | false | Global search |
+| FEATURE_FINE_GRAINED_RBAC | false | Fine-grained RBAC |
+| FEATURE_SUBSCRIPTION | true | WebSocket support |
+| RELATION_LEVEL | 0 (auto) | 1 normal / 3 Application |
+| HUB_NAME | | Hub cluster name |
+| HTTP_PORT | 4010 | Listen port |
+| CONTEXT_PATH | /searchapi | GraphQL path prefix |
 
 ## Commands
 
 ```bash
-make build    # Build binary
-make test     # Run tests
-make lint     # Lint
-make run      # Run locally (needs DB connection)
+make setup   # TLS cert + print DB env from cluster + port-forward hint
+make run     # PLAYGROUND_MODE=true go run -tags development --v=4
+make gqlgen  # Regenerate GraphQL code
+make test    # go test ./... -failfast
+make lint    # golangci-lint + gosec
+make send    # curl GraphQL (QUERY=schema|search|...)
 ```
 
-## How to: add a new GraphQL filter operator
+## Non-obvious Gotchas
 
-1. Update `graph/schema.graphqls` — regenerate with `make generate`
-2. Add operator case to `getWhereClauseExpression()` in `searchHelper.go`
-3. Update `matchOperatorToProperty()` to detect and route it
-4. Add E2E test in `search-e2e-test/tests/api/filter.test.js`
+1. **Unknown filter property → `1=0`** — silently returns zero rows, not an error
+2. **RBAC cache does NOT watch RoleBindings** — permission changes take up to `USER_CACHE_TTL` to propagate
+3. **Keywords force `jsonb_each_text` join** — expensive on large result sets
+4. **Related level 3 is heavy** — only auto-triggered for Application/relatedKinds
+5. **`kubeadmin` has empty UID** from TokenReview — special-cased in cache key
+6. **Readiness does NOT check DB** — pod reports ready even with broken postgres
+7. **`managedHub` filter is NOT SQL** — it decides whether this hub participates at all
+8. **Impersonation Extra headers** filtered to only `authentication.kubernetes.io/*` and `scopes.authorization.openshift.io/*`
 
-## How to: debug RBAC issues
+## Agent Playbooks
 
-1. Check who the user is: `oc whoami` / examine the Bearer token
-2. Enable verbose: `-v=5` on search-api pod
-3. Look for `UserData` in logs — shows computed namespace/cluster access
-4. Test SSAR manually: `oc auth can-i list pods --namespace=<ns> --as=<user>`
-5. Check cache TTL — might be seeing stale data (wait 10 min or restart pod)
+### Add a new GraphQL resolver
+1. Edit `graph/schema.graphqls`
+2. `make gqlgen`
+3. Implement in `graph/schema.resolvers.go` → logic in `pkg/resolver`
+4. Always call `GetUserData` + `buildRbacWhereClause` on any resources query
+
+### Add a new search filter property
+1. Ensure indexer/collector writes it into `data` jsonb
+2. Property types auto-discovered via `GetPropertyTypes` — no registration needed
+3. For special operators: extend `matchOperatorToProperty` / `getWhereClauseExpression`
+4. Virtual props (like `managedHub`): handle in `matchesManagedHubFilter` — do NOT add SQL
+
+### Debug missing results
+1. Query Postgres without RBAC: `SELECT * FROM search.resources WHERE data->>'name' = '…'`
+2. Check `_hubClusterResource`, `namespace`, `kind_plural`, `apigroup`, `cluster` values
+3. Verbose logs: `-v=5` for SQL; `-v=3` for RBAC mode
+4. Unknown filter property → silent `1=0` (check spelling/case)
+5. `managedHub` mismatch → empty on this hub
+
+### Debug RBAC denials
+1. Check token: `oc whoami` with same token
+2. Empty UserData → query fails with "RBAC clause is required"
+3. Fine-grained: empty UserPermissions → hub-only (managed data hidden)
+4. Global search SA needs `searches/allManagedData` get permission
+5. Watch uses separate SSAR path (`WatchCache`)
