@@ -94,6 +94,8 @@ oc annotate search search-v2-operator search-pause=true
 - New operator feature flag → annotation in `common.go` + new `controllers/feature_setup.go`
 - New MCP tool → `ToolDefinition` + handler + query in `queries.go`
 
+**For multi-repo changes** (new property, new kind, CRD change, etc.): load [modules/overview.md](modules/overview.md) — it has 10 step-by-step recipes listing exact files in each repo.
+
 ---
 
 ## Repos
