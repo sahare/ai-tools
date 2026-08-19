@@ -8,7 +8,7 @@ REPO="${1:?usage: list-candidates.sh <owner/repo>}"
 gh pr list --repo "$REPO" --state open --limit 200 \
   --json number,title,url,author,isDraft,labels,createdAt \
   --jq '[.[] | select(.isDraft == false) | select(
-      (.author.login | test("dependabot|renovate"; "i")) or
-      (.labels[]?.name | test("^dependenc"; "i")) or
+      (.author.login | test("dependabot|renovate|konflux"; "i")) or
+      any(.labels[]?; .name | test("^dependenc"; "i")) or
       (.title | test("^(fix|chore|build)\\(deps\\)|^(bump|update) "; "i"))
-    )]'
+    )] | unique_by(.number) | sort_by(-.number)'
