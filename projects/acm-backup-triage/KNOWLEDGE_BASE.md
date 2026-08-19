@@ -200,6 +200,15 @@ now, not hold.**
   This reverses the earlier "hold #1578/#1576" guidance above — those PRs (or a fresh equivalent
   bump) should now be pursued, not held. Also update `hack/crds/` envtest fixtures to the matching
   Velero 1.18 CRDs so CI actually exercises the new schema.
+  **Done (2026-08-19):** #1576 was rebased onto `main` (v1.16.2 → v1.18.2) and its
+  `ci/prow/crd-and-gen-files-check` failure fixed (the original PR never re-ran
+  `make manifests generate` — Velero 1.17+ added `VolumeGroupSnapshotLabelKey` to the
+  `Backup`/`Restore` spec types that `BackupSchedule`'s CRD embeds inline). The fix-and-push hit
+  the force-push/history bug documented in "Git/GitHub PR Mechanics — Gotchas" below, so #1576
+  ended up permanently closed and was recreated as
+  [#1733](https://github.com/stolostron/cluster-backup-operator/pull/1733) (open, mergeable, build/
+  vet/lint/test all verified clean at 93.1%/95.7% coverage). #1578 (the older, superseded v1.18.0
+  variant of the same bump) was left alone/not pursued — #1733 already supersedes it.
 - **Still true and unaffected by this resolution:** the `main` → `release-5.0` fast-forwarding gap
   (see below) — bumping on `main` still needs an explicit backport PR to reach `release-5.0`.
 - **Separately tracked, not resolved by this decision:** [ACM-42551](https://redhat.atlassian.net/browse/ACM-42551)
@@ -903,6 +912,58 @@ isn't actually reachable in practice (e.g., here: the controller runs single-thr
 `MaxConcurrentReconciles` is unset/defaults to 1, and only one caller invokes the function), it's
 reasonable to resolve the comment with an explanation rather than a code change, and note it as a
 possible future hardening item rather than a blocking issue.
+
+## Git/GitHub PR Mechanics — Gotchas
+
+### Force-pushing a bot PR branch rebuilt with `git archive` + `git init` permanently kills it
+**Symptom:** Fixing a stale/conflicting bot dependency-bump PR (e.g. a Konflux/Mintmaker PR) by
+extracting `main`'s tree via `git archive main | tar -x` into a fresh directory, `git init`-ing
+there, committing the fix, and force-pushing that to the PR's existing branch — the PR **silently
+auto-closes the instant the push lands**, and closing/reopening it afterward is **permanently
+blocked**: `gh pr reopen` and even a raw `PATCH .../pulls/<n>` both fail with
+`"state cannot be changed. The <branch> branch was force-pushed or recreated."`
+
+**Root cause:** `git archive` + `git init` produces a commit history with **no common ancestor**
+with `main` (confirmed via `gh api repos/<org>/<repo>/compare/main...<branch>` returning
+`"No common ancestor between main and <branch>."` / HTTP 404) — even though the file *contents*
+are byte-identical to `main`'s tip. GitHub can't compute a merge-base/diff for the PR once the head
+branch's history is disjoint from the base, and reacts by closing the PR outright; that specific
+closure reason then permanently forecloses reopening via the API.
+
+**This is a strictly worse outcome than the same technique used for reading/comparison purposes**
+— `git archive`-based snapshots are fine for e.g. extracting a clean tree to diff against, but must
+**never be force-pushed as a PR branch's new history**. Contrast with the successful pattern used
+earlier the same day for PRs [#1681](https://github.com/stolostron/cluster-backup-operator/pull/1681)
+and [#1694](https://github.com/stolostron/cluster-backup-operator/pull/1694) (see Backport/CI notes
+elsewhere in this doc) — those worked because the fix commit was built as a real child commit of
+`upstream/main` inside an actual clone (shared history preserved), not a from-scratch `git init`.
+
+**Correct procedure for fixing a conflicting bot PR going forward:**
+1. In a real local clone that already has the repo's history (`git fetch upstream main`), create a
+   new branch directly from `upstream/main`: `git checkout -B <tmp-branch> upstream/main`.
+2. Apply the fix as a normal commit on top of that (copy in the already-verified changed files, or
+   re-run `go get`/`go mod tidy`/`make manifests generate` directly in that checkout) — never via a
+   disjoint `git init` history.
+3. Verify (`go build`, `go vet`, `make lint`, `make test`) *in that same real-history checkout*.
+4. Force-push that branch to the PR's existing remote branch name.
+5. Sanity-check immediately after pushing:
+   `gh api repos/<org>/<repo>/compare/main...<branch> --jq '{status,ahead_by,behind_by}'` should
+   return a normal `ahead`/`behind` result, not a 404/"no common ancestor" error, and
+   `gh pr view <n> --json state` should still say `OPEN`.
+
+**If it happens anyway (PR already auto-closed):** don't waste time retrying `gh pr reopen` — the
+block is permanent for that PR/branch-history combination. The already-pushed branch itself is
+still fine once its history is fixed; just open a **brand new PR** from that same branch name
+(`gh pr create --base main --head <branch>`), reference the old PR number in the new PR's
+description, and leave a comment on the old (closed) PR linking to the new one so context isn't
+lost. Example: [#1576](https://github.com/stolostron/cluster-backup-operator/pull/1576) (killed by
+this bug) → recreated as [#1733](https://github.com/stolostron/cluster-backup-operator/pull/1733).
+
+**Unrelated but easy to conflate — the pre-existing `docs/ARCHITECTURE.md`/`docs/architecture.md`
+macOS case-collision issue** (separately documented via this same session's git workarounds) is a
+*different* problem (a real clone fails `git clone`/`git checkout` outright on a case-insensitive
+filesystem due to two files differing only by case) and is unrelated to this force-push/history
+issue — don't assume one workaround fixes the other.
 
 ## Information to Collect for Bug Reports
 
