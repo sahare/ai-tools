@@ -149,6 +149,39 @@ Resources are backed up in two categories:
 installer.open-cluster-management.io/oadp-subscription-spec: '{"channel": "stable-1.4"}'
 ```
 
+**Selection is automatic, not something the operator/team tracks per-hub (clarified by vbirsan,
+2026-08-19):** the backup chart's OLM subscription simply points at the OADP `stable` channel. OLM
+resolves which OADP version that channel means **based on the hub's own OCP version** at
+install/upgrade time — there's no manual "pick the right OADP version" step or per-hub bookkeeping
+on our side. The table above documents the resulting mapping for reference/support-case triage, it
+is not something we (or customers) need to actively manage day to day.
+
+**OADP ↔ Velero server version mapping** (what actually runs on the hub, via the `stable` channel):
+
+| OCP version | OADP version | Velero version (server-side) |
+|-------------|--------------|-------------------------------|
+| 4.14–4.15 | 1.3 / 1.4 | v1.12 / v1.14 |
+| 4.16–4.18 | 1.4 | v1.14 |
+| 4.19–4.21 | 1.5 | v1.16 |
+| 4.22–4.23 (~Q3 2026) | 1.6 | v1.18 |
+
+**Separate, narrower gotcha this does NOT resolve — our own `go.mod` Velero dependency:**
+`cluster-backup-operator`'s `go.mod` vendors `github.com/vmware-tanzu/velero` as a Go library, only
+to get the `Backup`/`Restore`/`Schedule` API types used to *construct* those CRs in code. That
+version is **independent of, and not auto-synced with**, whatever OADP/Velero version OLM's
+`stable` channel actually installs on a given hub. E.g. as of Aug 2026 our `go.mod` is pinned to
+Velero v1.16.2 (matches OADP 1.5 / OCP 4.19-4.21, the current default) — but once a hub moves to
+OCP 4.22+ and auto-gets OADP 1.6/Velero 1.18 server-side, our operator binary keeps building CRs
+using the older v1.16 API types. Usually harmless since Velero CRDs are additive across minors, but
+a new *required* field or stricter validation in 1.18 could make our CRs fail — and our envtest
+fixtures (`hack/crds/`) are also still pinned to the older CRD version, so CI wouldn't catch it
+either. Two open dependency PRs bump this ([#1578](https://github.com/stolostron/cluster-backup-operator/pull/1578),
+[#1576](https://github.com/stolostron/cluster-backup-operator/pull/1576)) — being held as of Aug
+2026 pending a decision on whether to bump proactively ahead of OCP 4.22, or wait until closer to
+when an ACM release actually claims 4.22 support. See also the "`main` → release-branch
+fast-forwarding" note below — as of Aug 2026, `main` does **not** auto-propagate to `release-5.0`,
+so a `main` bump would need an explicit backport to actually reach 5.0.
+
 ## ImportOnly Strategy (ACM 2.14+ / MCE 2.9+)
 
 The `ImportOnly` import strategy is critical for DR scenarios. It controls whether a hub cluster automatically re-imports managed clusters that become unreachable.
