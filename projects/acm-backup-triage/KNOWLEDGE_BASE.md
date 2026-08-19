@@ -175,12 +175,37 @@ OCP 4.22+ and auto-gets OADP 1.6/Velero 1.18 server-side, our operator binary ke
 using the older v1.16 API types. Usually harmless since Velero CRDs are additive across minors, but
 a new *required* field or stricter validation in 1.18 could make our CRs fail — and our envtest
 fixtures (`hack/crds/`) are also still pinned to the older CRD version, so CI wouldn't catch it
-either. Two open dependency PRs bump this ([#1578](https://github.com/stolostron/cluster-backup-operator/pull/1578),
-[#1576](https://github.com/stolostron/cluster-backup-operator/pull/1576)) — being held as of Aug
-2026 pending a decision on whether to bump proactively ahead of OCP 4.22, or wait until closer to
-when an ACM release actually claims 4.22 support. See also the "`main` → release-branch
-fast-forwarding" note below — as of Aug 2026, `main` does **not** auto-propagate to `release-5.0`,
-so a `main` bump would need an explicit backport to actually reach 5.0.
+either. See also the "`main` → release-branch fast-forwarding" note below — as of Aug 2026, `main`
+does **not** auto-propagate to `release-5.0`, so a `main` bump would need an explicit backport to
+actually reach 5.0.
+
+**RESOLVED (2026-08-19, #forum-acm-backupandrestore thread, sahare/vbirsan/Tesshu
+Flower/Thuy Nguyen/msmigiel): ACM 5.0's actual OCP support range confirmed, decision made to bump
+now, not hold.**
+- Initial open question in the thread: does ACM 5.0 actually support OCP 4.22, or only OCP 5.0+
+  (Tesshu Flower's assumption, guessing OCP 4.22 might only be a transient "during upgrade" state)?
+- **Confirmed via an internal "ACM Upgrade to 5.0" planning chart** (support-matrix image, sourced
+  from the HPSTRAT-30/ACM-5.0-MVP planning docs; the PDF's text layer loses the table grid on
+  extraction — render it to an image and read pixel colors per cell if this needs re-verifying):
+  **ACM 5.0 has full support (not upgrade-only) for OCP 4.20, 4.21, 4.22, 4.23, 5.0, and 5.1** (not
+  5.2). Cross-confirmed independently by Thuy Nguyen citing msmigiel: "ACM 5.0 supports 4.22 / 4.23
+  / 5.0 / 5.1." Tesshu's "upgrade-only" theory was incorrect — this is full support, not a
+  transient upgrade state.
+- **Practical conclusion (vbirsan):** since OADP's own version-to-OCP mapping means OADP 1.6
+  (Velero v1.18) is what actually installs on OCP 4.22+, and ACM 5.0 supports OCP 4.22+, **OADP
+  1.5/Velero v1.16 can be dropped from consideration for ACM 5.0 entirely** — there's no scenario
+  where an ACM-5.0-supported hub runs OADP 1.5 without also being able to run 1.6.
+- **Decision:** bump `go.mod`'s `github.com/vmware-tanzu/velero` to v1.18.x for `main`/ACM 5.0 now
+  (not "hold until closer to when 5.0 claims 4.22 support" — that condition is already satisfied).
+  This reverses the earlier "hold #1578/#1576" guidance above — those PRs (or a fresh equivalent
+  bump) should now be pursued, not held. Also update `hack/crds/` envtest fixtures to the matching
+  Velero 1.18 CRDs so CI actually exercises the new schema.
+- **Still true and unaffected by this resolution:** the `main` → `release-5.0` fast-forwarding gap
+  (see below) — bumping on `main` still needs an explicit backport PR to reach `release-5.0`.
+- **Separately tracked, not resolved by this decision:** [ACM-42551](https://redhat.atlassian.net/browse/ACM-42551)
+  (moving to the unstructured/dynamic Velero client to remove this whole class of go.mod-vs-runtime
+  drift risk going forward) is still valid future work for 5.1+, independent of this immediate
+  version bump.
 
 ## ImportOnly Strategy (ACM 2.14+ / MCE 2.9+)
 
