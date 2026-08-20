@@ -803,6 +803,49 @@ oc logs -n open-cluster-management-backup -l app=cluster-backup-chart-clusterbac
   - **Go/No-Go criteria before DR:** All ClusterDeployments have preserveOnDelete=true, credentials validated, ArgoCD sync pause automated, manual recovery steps documented.
 **Case reference:** #04440443 (Amadeus)
 
+### 20b. "Batching large-fleet failover to reduce blast radius" (Richard Mitchell / QE Thuy Nguyen, Aug 2026)
+**Category:** Architecture guidance — corrects an earlier wrong assumption (batching IS supported)
+
+**Question:** For a hub managing 700+ SNOs failing over to a new hub, should it be one wholesale
+restore, or can it be batched to reduce impact if something goes wrong?
+
+**First-pass wrong answer (don't repeat this):** assuming there's no supported way to scope a
+restore below the whole-category level, and that "impact reduction" has to happen at the
+infra/capacity layer instead of the restore itself. **This is wrong** — a supported batching
+mechanism already exists.
+
+**Correct answer: reuse the "move managed clusters" 3-step procedure (see #10/#10b) as the batching
+mechanism**, per QE. It's not just for moving clusters between independent hubs — the same
+`includedNamespaces` / `orLabelSelectors` scoping works for a same-fleet failover, and batch size is
+fully tunable:
+- **step0** (optional, run once): restores general hub data (apps/policies/credentials) hub-wide,
+  excluding `ManagedCluster` objects and the managed-cluster namespaces — nothing activates yet.
+- **step1** (per batch): restores everything *in* a batch's managed-cluster namespaces via
+  `includedNamespaces` (list as many namespaces as the batch should contain), excluding the
+  `ManagedCluster` object itself.
+- **step2** (per batch): restores *only* the `ManagedCluster` global resource for that batch's
+  clusters, scoped via `orLabelSelectors` matching cluster `name` — **this is the actual activation
+  trigger** that kicks off klusterlet re-registration. Wait for `Ready` before starting the next
+  batch.
+
+Sample YAMLs: [`config/samples/usecases/move-clusters/`](https://github.com/stolostron/cluster-backup-operator/tree/main/config/samples/usecases/move-clusters).
+
+**Why this actually reduces impact (not just Velero throughput):** raw restore speed at scale is
+already proven fine (3,500+ SNOs restore per category in minutes — see
+[Large-Scale Environment perf numbers](../../../README.md#acm-backup-and-restore-performance-in-a-large-scale-environment)).
+The real risk at 700+ SNO scale is the **downstream reconcile storm** when klusterlets/BareMetalHosts
+all reconnect to the new hub simultaneously (the same class of issue as ACM-39330 below). Batching
+step2 specifically throttles *that*, since step2 is the only step that flips `ManagedCluster`
+objects live.
+
+**Constraint to flag to QE/test plans:** only one ACM `Restore` CR can be active at a time (webhook-
+enforced), so step0→1→2 and every subsequent batch must run strictly sequentially — wait for
+`Finished` before creating the next `Restore`, don't fire batches concurrently.
+
+**Test on 2.17.1** (targeted 2026-08-26) — it ships the SiteConfig-side fix for ACM-39330 (see #21),
+which matters here because ManagedCluster activation in step2 is exactly where that BareMetalHost
+race could otherwise surface.
+
 ### 21. "BareMetalHost stuck in Inspecting after DR / ClusterInstance restored when it shouldn't be" (ACM-39330)
 **Category:** Confirmed cluster-backup-operator gap, fix delivered (partial), fixed in code.
 **Reporter:** Sunny, Aug 2026 — ZTP/bare-metal fleet with passive-sync DR.
@@ -823,11 +866,19 @@ activation-gated like `agent-install.openshift.io` resources — so it got resto
 during passive sync (`veleroManagedClustersBackupName: skip`), with no failover happening at all,
 triggering unwanted Day-1 re-renders.
 
-**Fix (Exposure #1 — passive-sync, DONE):** added `siteconfig.open-cluster-management.io` to
-`includedActivationAPIGroupsByName` (`controllers/backup.go`), routing `ClusterInstance` into the
-managed-clusters activation tier. Now it's only restored during a real failover (`latest`), same as
-`agent-install.openshift.io` resources. PR: [#1685](https://github.com/stolostron/cluster-backup-operator/pull/1685)
-(merged to `main`), cherry-picked to `release-2.17` as [#1687](https://github.com/stolostron/cluster-backup-operator/pull/1687).
+**Fix (Exposure #1 — passive-sync) — SHIPPED THEN REVERTED, superseded by SiteConfig's own fix:**
+initial attempt added `siteconfig.open-cluster-management.io` to `includedActivationAPIGroupsByName`
+(`controllers/backup.go`), routing `ClusterInstance` into the managed-clusters activation tier. PR:
+[#1685](https://github.com/stolostron/cluster-backup-operator/pull/1685) (merged to `main`),
+cherry-picked to `release-2.17` as [#1687](https://github.com/stolostron/cluster-backup-operator/pull/1687).
+**This was later reverted** ([#1731](https://github.com/stolostron/cluster-backup-operator/pull/1731),
+reverted on both `main` and `release-2.17`) because it conflicted architecturally with a fix landing
+in the SiteConfig controller itself — the two fixes fought each other, and the SiteConfig-side fix
+was chosen as the actual solution instead of the operator-side activation-gating change.
+**Bottom line: `cluster-backup-operator` main/2.17 does NOT contain an ACM-39330 fix of its own —
+the fix lives entirely in SiteConfig, and ships as part of ACM 2.17.1 (targeted 2026-08-26).** If
+asked "does the operator have the ACM-39330 fix," the correct answer is "no — check the SiteConfig
+controller / 2.17.1 build," not this repo's git history.
 
 **NOT yet fixed (Exposure #2 — failover-ordering):** even during a *real* failover, `ClusterInstance`
 has no restore-order priority and Velero doesn't restore `.status` by default, so SiteConfig can
