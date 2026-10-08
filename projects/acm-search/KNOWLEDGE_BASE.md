@@ -1616,6 +1616,37 @@ annotation-only included, triggers an immediate `Manifests()` re-render.
 - Confirmed `search-collector` requires zero code changes — its existing hot-reload watch
   (ACM-20047, see elsewhere in this file) picked up the newly-arrived CR with no pod restart.
 
+**Second live test (fresh single-hub + imported-SNO pair, custom images via `Dockerfile.local` +
+pause-MCH technique)** — re-ran the full flow end-to-end on a brand-new ACM 5.0 dev-build install
+to re-validate before opening PRs. Confirmed again: TC-1/TC-2 (fresh config + integration-only
+rules distribute with no user customization), TC-3/TC-15 (hub edit → spoke `merged-collector-config`
+within ~1-3s once both controllers are actually reconciling), TC-4 (zero `search-collector`/addon
+pod restarts across the whole test), TC-13 (spoke copy's only `ownerReference` is the
+`AppliedManifestWork`, never a dangling `Search` CR ref). Two **test-methodology** gotchas worth
+recording for future live tests of this feature (not code bugs — both are artifacts of
+image-only custom deploys bypassing the CSV/bundle):
+  1. **Do NOT use `search-pause: true` on the `Search` CR when testing this feature.** The
+     hub-side `CollectorConfig` merge logic lives inside the same reconcile loop that
+     `search-pause` short-circuits ("Reconciliation is paused..." log line) — pausing it blocks
+     the very merge this feature depends on. The `installer.open-cluster-management.io/pause`
+     annotation on the `MultiClusterHub` CR alone is sufficient to protect a custom
+     `search-v2-operator`/`klusterlet-addon-controller` image from being reverted (MCH, not the
+     Search CR, owns those Deployment specs) — pause MCH only, leave the Search CR unpaused.
+  2. **Swapping just the container image does not bring in new RBAC.** `deploy/role.yaml`
+     changes in a `klusterlet-addon-controller` branch only ship via the OLM bundle/CSV
+     `clusterPermissions`, which a plain `oc set image` on the live Deployment never touches. If
+     the live `ClusterRole` predates the branch, the controller logs clear `Forbidden` errors on
+     `collectorconfigs`/`searches` (exactly the TC-16 "fail loud, not silent" behavior the design
+     requires) and distribution silently never happens. Fix for live testing: manually
+     `oc patch clusterrole "open-cluster-management:klusterlet-addon-controller-v2"` with the new
+     rules from the branch's `deploy/role.yaml` diff before testing.
+  Also noted: `search-collector`'s "configurable collection" feature itself was gated off by
+  default in this build (`"Configurable collection feature is disabled, skipping custom config
+  load"` in its logs) — expected, since that pod's image wasn't swapped (only
+  `search-v2-operator` and `klusterlet-addon-controller` were under test). This test validates the
+  **distribution path only** (CRD correctly lands on the spoke, byte-for-byte, no owner-ref leak,
+  no restart); full collector-side consumption needs that separate feature flag enabled.
+
 ### Future enhancement: per-cluster exceptions (NOT implemented, tracked for a follow-up ticket)
 
 Raised by the team lead after the above was already built/tested: some managed clusters may need
