@@ -907,6 +907,39 @@ If you add a new warning path, add a new entry to `distinctWarningRules` in the 
 
 ## ACM Backup/Restore and CollectorConfig (ACM-20052)
 
+### KNOWN GAP (ACM-42665, found Aug 2026): restore always fails to relabel integration CollectorConfigs
+
+The backup label added by ACM-20052 gets these CRs into `acm-resources-generic-schedule`, but
+`rejectIfProtected()` in `collectorconfig_webhook.go` has no exemption for the backup/restore
+service account (`open-cluster-management-backup:velero`) — only for SAs in the CollectorConfig's
+own namespace and the k8s GC SA (delete-only). Every restore's post-create relabel patch
+(`cluster-backup-operator` runs with `ExistingResourcePolicy: update`) hits:
+
+```
+admission webhook "vcollectorconfig.kb.io" denied the request: <name> is managed by the search
+operator and cannot be modified directly
+```
+
+This is **deterministic** (100% reproducible, every restore, confirmed on two independent live
+hubs) and produces `PartiallyFailed` on `acm-resources-generic-schedule`. It's harmless (the
+webhook blocks the patch, the correct pre-existing object — already independently seeded by
+search-v2-operator on the target hub — is left untouched), but it will not self-heal like an
+ordinary transient race. Candidate fixes: (a) cluster-backup-operator excludes
+`collectorconfigs.search.open-cluster-management.io` from restore, (b) webhook adds an exemption
+for the backup/restore SA (mirroring the existing GC-SA exemption), or (c) drop the backup label
+entirely since the seeder already reseeds these on every hub at startup (ACM-37052) — restoring
+them from a Hub1 backup serves no purpose on Hub2.
+
+**Do not confuse this with the separate NetworkPolicy/hostNetwork webhook-connectivity bug**
+(search-v2-operator PRs #781/#860/#861 — restrictive `search-operator-network-policy` on
+OVN-Kubernetes + `hostNetwork: true` apiserver pods can make the apiserver→webhook call itself
+time out). That bug's error text is `Internal error ... failed calling webhook "vcollectorconfig.kb.io":
+failed to call webhook: ... context deadline exceeded` — completely different from the
+`denied the request: ... cannot be modified directly` ownership-protection message above. Verified
+live: a hub with the NetworkPolicy fix already applied (0/5 timeouts) still denied the restore
+patch 5/5 times with the ownership message — the two bugs are fully independent. Always check the
+exact error text before attributing a `CollectorConfig` admission failure to either one.
+
 ### Why search resources are excluded from automatic backup
 
 `cluster-backup-operator/controllers/backup.go` has an `excludedAPIGroups` list that includes
@@ -1469,3 +1502,167 @@ and tradeoffs aren't lost. See `README.md` for the plain-language version of eac
 - Challenge: **RBAC** — a webhook endpoint doesn't carry a logged-in user's identity/permissions
   the way an authenticated websocket session does, so deciding what a given webhook
   subscription is allowed to receive needs its own design.
+
+---
+
+## Distributing CollectorConfig hub → managed clusters (ACM-18537, epic ACM-37882)
+
+**Jira:** "AS ACM admin, I want my search configuration to be distributed to managed clusters."
+**Status (as of this writing):** Implemented and live-tested on two real ACM 5.0 clusters; clean,
+Jira-reference-free branches pushed to both repos, PRs not yet opened. Full design doc + QE test
+plan live at `~/Downloads/acm-search-design-docs/ACM-18537-collectorconfig-distribution.md` and
+`ACM-18537-test-plan.md` (deliberately kept out of the actual PR branches per the author's request
+— the branches contain only code + updates to pre-existing `docs/ARCHITECTURE.md`/`docs/RBAC.md`).
+
+### Problem
+
+The hub computes a merged `CollectorConfig` CR (`merged-collector-config`, from
+`createOrUpdateMergedCollectorConfig` — see "Exclude Action" section above for the merge/overlap
+logic) but it only ever lived on the hub. `search-collector` already runs on every managed cluster
+via the `search-collector` OCM addon and already knows how to read+hot-reload a CR with that exact
+name from its own local namespace — nothing ever put one there. The only workaround was a
+hand-authored ACM `Policy`, which the ticket explicitly calls "not intuitive or user friendly."
+
+### Architecture: reuse the existing addon ManifestWork channel, don't build a new one
+
+`search-collector`'s addon (`search-v2-operator/addon/addon.go`,
+`NewAgentAddonFactory(...).BuildHelmAgentAddon()`) already ships a `ManifestWork` per managed
+cluster (Deployment, RBAC, NetworkPolicy, the `CollectorConfig` **CRD** — but never a populated
+**CR**) via `addon-framework`'s Helm-chart-rendering pipeline. The fix: render one more object
+(the populated CR) through that same pipeline. Zero `search-collector` code changes required.
+
+Two repos, two complementary pieces — **both required together**, not an MVP + optional follow-up:
+
+**1. `search-v2-operator`** (branch: `feat/distribute-collectorconfig-to-managed-clusters`) — the
+*rendering* side:
+- New `GetValuesFunc` `getCollectorConfigValue(hubClient)`, inserted at position `[1]` in
+  `NewAddonManager`'s `WithGetValuesFuncs` chain (`addon/addon.go`). Resolves the hub's single
+  `Search` CR namespace (`resolveSearchNamespace`, duplicated from
+  `controllers.IntegrationCollectorConfigSeeder.resolveSearch` — can't import `controllers`
+  because `controllers` already imports `addon`), then `Get`s `merged-collector-config` from that
+  namespace and injects **only `.Spec`** into `Values["collectorConfig"]["spec"]`.
+- New Helm template `addon/manifests/chart/templates/collectorconfig_cr.yaml`, guarded on
+  `hasKey .Values "collectorConfig"` (key existence, NOT truthiness of `.spec` — an empty-but-valid
+  `CollectionRules: []` is a meaningful "no customizations" state and must still render).
+- New Helm template `addon/manifests/chart/templates/collectorconfig_editor_role.yaml` — a
+  `ClusterRole` labeled `rbac.authorization.k8s.io/aggregate-to-admin: "true"` granting the OCM
+  work-agent (bound to built-in `admin` via Kubernetes' own role-aggregation) permission on
+  `collectorconfigs`. **Found live during testing**: without this, every work-agent apply of the
+  distributed CR failed with `is forbidden` — a CRD's own controller-generated RBAC never
+  automatically grants anything to a cluster's built-in `admin`/`edit`/`view` roles.
+
+**2. `klusterlet-addon-controller`** (branch: `feat/propagate-collectorconfig-to-search-collector-addon`)
+— the *event-driven trigger* side, closing a real latency gap (see below):
+- New watch on the `CollectorConfig` GVK in `pkg/controller/addon/add_manager.go`, re-enqueueing
+  every `ManagedCluster` when `merged-collector-config` changes on the hub. Set up defensively — a
+  hub without the search component (no CRD) logs a warning and continues, doesn't fail controller
+  startup.
+- `buildAddonValuesAnnotation` (new, replaces the direct `marshalGlobalValues` call in
+  `updateManagedClusterAddon`) adds a `collectorConfig` key to the existing
+  `addon.open-cluster-management.io/values` annotation on the `search-collector`
+  `ManagedClusterAddOn` — **only** for that addon. `search-v2-operator`'s pre-existing
+  `GetValuesFromAddonAnnotation` step (already in the chain before this feature, generic to every
+  addon) reads this same key — no protocol change needed on that side.
+- RBAC fix (`deploy/role.yaml`): `get`/`list` on `searches`, `get`/`list`/`watch` on
+  `collectorconfigs` — without it, every hub Search/CollectorConfig read fails `Forbidden` on any
+  hub with the search component installed (caught by code review before merge, not live testing).
+- Implemented against `unstructured.Unstructured` with a manually-set GVK, deliberately **not** a
+  Go dependency on `search-v2-operator`'s `api/v1alpha1` package — the two operators are released
+  independently and the search component may not be installed on every hub.
+
+### Why both pieces are required, not "nice to have" — the propagation-latency trap
+
+Addon-framework's `addonmanager.New` constructs its `ManagedClusterAddOn` informer with a
+**10-minute resync period** (`addon-framework@v0.12.0`, `pkg/addonmanager/manager.go`:
+`addoninformers.NewSharedInformerFactory(addonClient, 10*time.Minute)`). This causes periodic
+synthetic resync events that happen to trigger a re-render — but **this is an implementation
+detail of the framework's informer wiring, not a documented contract.** `search-v2-operator`'s own
+`WithConfigGVRs(...)` only watches `utils.AddOnDeploymentConfigGVR`, NOT the `CollectorConfig` GVR
+— so a hub-side config change does **not**, by itself, trigger an immediate re-render through that
+mechanism. Without the `klusterlet-addon-controller` watch, propagation silently depends on the
+incidental resync (worst case ~20 min: up to 10 for the operator's own reconcile + up to 10 for the
+addon-framework's resync) — "not acceptable for GA," and if addon-framework ever changes to a zero
+resync period (a common perf optimization), propagation would **silently stop entirely** with the
+CR only ever set once, at cluster-import time.
+
+With both pieces: event-driven, near-real-time — bounded mainly by the operator's own reconcile
+loop noticing the `user-collector-config`/integration-config change, not by the addon framework.
+Confirmed live: an edit to `ManagedClusterAddOn` (annotations included) is already watched by
+addon-framework's own `addonDeployController` with no field/spec-only predicate — any change,
+annotation-only included, triggers an immediate `Manifests()` re-render.
+
+### Correctness requirements (do not regress)
+
+- **Extract `.Spec` only, never the whole hub CR.** The hub's `merged-collector-config` carries a
+  controller `ownerReference` to the hub `Search` CR (`SetControllerReference`,
+  `controllers/create_collectorconfig.go`). A managed cluster has no matching object — marshaling
+  the full object would leak a dangling `ownerReference`, risking GC issues. Only ever set `spec:`.
+- **No admission webhook on managed clusters** — the `CollectorConfig` validating webhook only runs
+  on the hub; managed clusters receive only the CRD via `ManifestWork`. If a webhook is ever added
+  to the addon chart, it must NOT apply the hub's ownership-protection check to this CR (it will
+  legitimately have no `ownerReferences` on the spoke).
+- Error handling in `getCollectorConfigValue`: "not found yet" (no `Search` CR, or
+  `merged-collector-config` not computed yet — both legitimate during a fresh-install race) →
+  `(Values{}, nil)`. Any OTHER error → propagate, don't swallow — swallowing would make
+  addon-framework re-render a manifest list that *omits* (and thus deletes) a previously-delivered
+  CR from every managed cluster. Same pattern on the `klusterlet-addon-controller` side.
+
+### Live-test findings (two real ACM 5.0 clusters)
+
+- Confirmed byte-for-byte identical `merged-collector-config` broadcast across both managed
+  clusters, hub edits propagating to both within ~1 second once both branches were deployed.
+- Found and fixed the work-agent RBAC gap (`collectorconfig_editor_role.yaml`, above) — not
+  theoretical, reproduced 100% of the time without it.
+- Confirmed `search-collector` requires zero code changes — its existing hot-reload watch
+  (ACM-20047, see elsewhere in this file) picked up the newly-arrived CR with no pod restart.
+
+### Future enhancement: per-cluster exceptions (NOT implemented, tracked for a follow-up ticket)
+
+Raised by the team lead after the above was already built/tested: some managed clusters may need
+to deviate from the fleet-wide broadcast default (e.g. exclude a resource type on one specific
+cluster only). **Important distinction:** this is a *separate*, deliberately deferred ticket — do
+not confuse it with the `klusterlet-addon-controller` event-driven wiring above, which is core to
+*this* ticket and already shipped/tested. Full adversarial-review trail (two rounds, Opus) is in
+the design doc; summary:
+
+- **Recommended final design — Phase 1 (annotation-driven per-cluster delta):**
+  `getCollectorConfigValue` already runs once per cluster and already receives that cluster's
+  `ManagedClusterAddOn` object as a parameter (same object `search_memory_limit`/`search_args` are
+  already read from today) — this is already the per-cluster override hook, just not used for
+  collection rules yet. Add a new annotation (e.g.
+  `addon.open-cluster-management.io/search_collector_config_override`) holding a JSON-encoded
+  `[]CollectionRule` delta; `getCollectorConfigValue` decodes and appends it to the global
+  `CollectionRules` **inline, in the same function** (critical: `addonfactory.MergeValues`
+  deep-merges maps but *replaces* JSON arrays — a second, later `GetValuesFunc` merging the delta
+  would clobber the global list instead of extending it).
+- **Validation gap, must be explicitly decided, not defaulted into:** the annotation path bypasses
+  the *entire* `CollectorConfig` webhook (`validateCollectorConfig()` — protected kinds/apiGroups,
+  exclude-rule structural constraints, field/JSONPath validation, exclude-vs-integration overlap
+  check), not just the overlap check as first assumed. Either re-implement ~100 lines of validation
+  parity in Go, or explicitly document this as a validated-nothing, admin-only escape hatch.
+- Annotation size ceiling: Kubernetes' real limit is **256 KiB total across all annotations on one
+  object** (not "a few MB" as first assumed) — still comfortably enough for hundreds of rules.
+- RBAC-boundary note: whoever can `update` a `ManagedClusterAddOn` (cluster-lifecycle-level
+  permission) can set this annotation — broader in principle than `collectorconfigs` RBAC today
+  (likely equivalent in practice, both typically cluster-admin-only, but should be stated not
+  assumed).
+- **Phase 2 (defer, only if Phase 1's UX friction becomes a real complaint):** a narrow,
+  purpose-built CRD (e.g. `CollectorConfigOverride`) in the managed cluster's own hub namespace,
+  read synchronously inline by `getCollectorConfigValue` (no new watch/controller) — deliberately
+  not reusing the general `CollectorConfig` Kind, so it doesn't inherit its heavier
+  ownership-protection webhook machinery.
+- **Rejected alternatives:** a namespace-convention CR approach (first proposal — rejected after
+  adversarial review found: webhook's exclude/overlap check silently stops protecting anything
+  outside the operator's namespace; cross-namespace `ownerReference` is forbidden with no GC story;
+  no existing per-cluster reconcile infrastructure — `SearchReconciler`'s watch explicitly filters
+  out `merged-collector-config`-named objects). OCM's native
+  `AddOnDeploymentConfig`/`ManagedClusterAddOn.spec.configs[]` (rejected — would require teaching
+  `klusterlet-addon-controller` to write `spec.configs[]`, a first-of-its-kind change in that repo,
+  the same concern that ruled out this mechanism for the fleet-wide default in the first place).
+
+### Why this isn't ACM-35522/ACM-37052/ACM-20052 all over again
+
+Same codebase, same `CollectorConfig` type, but a genuinely different concern: those three are
+about *what rules apply on the hub*; this one is about *getting the hub's already-computed answer
+onto every spoke*. The merge/validation logic (`createOrUpdateMergedCollectorConfig`,
+`validateCollectorConfig`) is reused as-is and untouched by this feature.

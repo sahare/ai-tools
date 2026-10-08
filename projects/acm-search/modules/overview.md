@@ -183,6 +183,25 @@ These recipes tell agents exactly which repos and files to touch for common mult
 | 3 | search-v2-operator | `api/v1alpha1/collectorconfig_webhook.go` | Remove team's apiGroups from `protectedAPIGroups` if they were there |
 | 4 | search-v2-operator | webhook + seeder tests | Update test expectations |
 
+### Recipe 11: Distribute a hub-side CR to every managed cluster (via the search-collector addon)
+
+Pattern established by ACM-18537 (see KNOWLEDGE_BASE.md for full detail). Requires **both** steps
+below together — step 2 alone is a silent latency trap (relies on an undocumented addon-framework
+resync interval), not a documented contract.
+
+| Step | Repo | File(s) | What to do |
+|------|------|---------|------------|
+| 1 | search-v2-operator | `addon/addon.go` | New `GetValuesFunc` reading the hub CR's `.Spec` only (never the full object — strips the hub's `ownerReference`) into `Values`; propagate real errors, return `(Values{}, nil)` only for legitimate "not found yet" |
+| 2 | search-v2-operator | `addon/manifests/chart/templates/{thing}_cr.yaml` | New Helm template, guarded on Helm key *existence* not truthiness |
+| 3 | search-v2-operator | `addon/manifests/chart/templates/{thing}_editor_role.yaml` | Aggregated `ClusterRole` (`rbac.authorization.k8s.io/aggregate-to-admin: "true"`) — without it the work-agent has no RBAC on the new resource type at all |
+| 4 | klusterlet-addon-controller | `pkg/controller/addon/add_manager.go` | New watch on the hub CR's GVK, re-enqueueing every `ManagedCluster` on change — this is what makes propagation event-driven instead of resync-dependent |
+| 5 | klusterlet-addon-controller | `pkg/controller/addon/klusterlet_addon_controller.go` | Fold the CR's `.Spec` into the existing `addon.open-cluster-management.io/values` annotation, scoped to the specific addon only |
+| 6 | klusterlet-addon-controller | `deploy/role.yaml` | RBAC for the new hub-side read (`get`/`list`/`watch` as needed) |
+
+**Do not skip step 4-6** to "ship an MVP first" — the fleet-wide default must be event-driven from
+day one; see "Why this isn't optional" in the ACM-18537 KB entry for the exact failure mode
+(propagation silently stops entirely if addon-framework's resync period ever changes).
+
 ---
 
 ## Token-Saving Tips for Agents
