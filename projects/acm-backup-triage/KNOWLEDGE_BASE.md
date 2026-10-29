@@ -250,6 +250,64 @@ oc -n multicluster-engine label configmap import-controller-config \
 
 **ALWAYS mention ImportOnly when discussing:** controlled failover, planned switchover, non-destructive DR testing, moving managed clusters, or any scenario where two hubs could compete for the same clusters.
 
+**Scope limitation — does NOT cover Hive `SyncSet` reconciliation:** `ImportOnly` only stops the old
+hub's *import-controller* from re-importing/re-syncing the klusterlet agent onto a cluster that
+moved elsewhere. It has no effect on Hive's independent reconciliation loop for `ClusterDeployment`/
+`SyncSet` objects — a hub correctly configured with `ImportOnly` can still exhibit the old-hub
+`SyncSet`-overwrite symptom described in [issue #10c](#10c-old-hubs-hive-controller-keeps-reconciling-overwrites-certs-etc-after-a-migrated-cluster-is-detached-acm-43200)
+below (e.g. cert secrets reverted by the old hub). For Hive-provisioned clusters, `ImportOnly` and
+`hive.openshift.io/syncset-pause: "true"` (or `ClusterRelocate`) address two separate control loops
+and are both needed to fully stop "two hubs competing for the same cluster."
+
+## DR Simulation with `disable-auto-import` (keep the original hub running)
+
+**Source:** internal Slack thread, Oct 2026, Valentina Birsan (vbirsan) and Roke drafting
+non-technical customer-doc language for the Business Continuity guide's `disable-auto-import`
+section (reviewed with Thuy Nguyen). Refines/corrects the "Failback to original primary" steps in
+the [Controlled Failover](#controlled-failover--planned-switchover) section below with the precise,
+confirmed procedure.
+
+**`ImportOnly` vs. `disable-auto-import` — when to use which:**
+- **`ImportOnly` strategy** ([above](#importonly-strategy-acm-214--mce-29)): for a hub DR scenario
+  where the original hub actually goes down/unreachable, and you want to prevent it from reclaiming
+  the managed clusters if it unexpectedly restarts after the clusters already moved elsewhere.
+- **`disable-auto-import` annotation on the `ManagedCluster` resources**: for a **DR *simulation***,
+  where you deliberately keep the original hub running and reachable throughout the test while
+  moving managed clusters to a different hub. Because the original hub never actually goes down,
+  `ImportOnly` alone doesn't model this correctly — you instead annotate the specific
+  `ManagedCluster` resources on the hub you want to "freeze" for the duration of the test.
+
+**`disable-auto-import` supersedes every other annotation or import strategy.** If it's present on
+a `ManagedCluster` at the same time as `immediate-import`, the import will **not** be triggered —
+you must remove `disable-auto-import` first. Only keep it set for the duration of the simulation
+and remove it immediately once the test is done.
+
+**Failback procedure — moving managed clusters back to the original hub after a simulation:**
+
+0. On the hub **currently managing** the clusters (the one they were moved to for the simulation),
+   add the `disable-auto-import` annotation to those `ManagedCluster` resources, so that hub doesn't
+   try to recover them once they move back to the original hub.
+1. On the **original hub**, remove the `disable-auto-import` annotation from the `ManagedCluster`
+   resources.
+2. Add the `import.open-cluster-management.io/immediate-import` annotation on the original hub to
+   trigger reimport even though `ImportOnly` strategy may be set.
+3. **Non-Hive (imported) clusters only:** create the auto-import secret to actually trigger the
+   import. Hive-provisioned clusters don't need this — Hive drives their reconnection directly.
+
+**Resuming backups on the original hub after a simulation (per Roke):** if you want to start taking
+backups again from the hub where you previously set `disable-auto-import`, remove the annotation
+first. Removing it will **not** cause the spoke to re-join that hub on its own, as long as
+`ImportOnly` strategy is in effect — so it's safe to remove without triggering an unwanted
+reconnection.
+
+**Gotcha — `ImportAndSync` does not make failback automatic (per Roke):** for imported (non-Hive)
+clusters, even with `autoImportStrategy=ImportAndSync` (which continuously re-syncs klusterlet
+manifests), simply removing `disable-auto-import` will **not** reimport the cluster on its own. The
+import-controller deletes the `auto-import-secret` once a cluster successfully imports, so on any
+subsequent re-import (e.g., failback) the import will fail without a secret — **regardless of which
+`autoImportStrategy` is configured.** Step 3 above (manually recreate the auto-import secret) is
+always required for non-Hive clusters.
+
 ## Controlled Failover / Planned Switchover
 
 For planned maintenance, DR testing, or intentional site switches (not just disaster scenarios):
@@ -272,6 +330,8 @@ For planned maintenance, DR testing, or intentional site switches (not just disa
 2. Create BackupSchedule on secondary, wait for at least one successful backup
 3. Pause backups on secondary
 4. Restore on original primary with `cleanupBeforeRestore: CleanupRestored`
+
+**For the precise, confirmed annotation sequence** (including the secondary-hub `disable-auto-import` step, the `immediate-import` annotation, and the auto-import-secret gotcha for non-Hive clusters) — see [DR Simulation with `disable-auto-import`](#dr-simulation-with-disable-auto-import-keep-the-original-hub-running) above.
 5. **Important:** For imported (non-Hive) clusters, MSA auto-import will likely fail because the token was invalidated when spokes connected to the secondary during failover. Manual reimport with fresh spoke credentials is required (see issue #5 below).
 6. Re-enable BackupSchedule on original primary
 7. Re-enable passive sync on secondary
@@ -384,6 +444,12 @@ After deletion, the controller will create new Velero restores on the next sync 
   2. Is `cleanupBeforeRestore` valid? (must be `None`, `CleanupRestored`, or `CleanupAll`)
   3. Check `status.lastMessage` for Velero `PartiallyFailed` — some resources may fail to restore but overall restore works
   4. Velero PartiallyFailed is often **normal** for empty backup files (no resources matched the selector in `acm-resources-generic-schedule`)
+  5. **Two more confirmed benign `PartiallyFailed` sub-causes (ACM-42666 / ACM-42665, ACM 5.0, root-caused Aug 2026 with live dual-hub access):**
+     - **Root mechanism common to both:** `cluster-backup-operator` hardcodes `veleroRestore.Spec.ExistingResourcePolicy = PolicyTypeUpdate` (`controllers/restore.go`). With this policy, Velero follows every item create/patch with an *immediate second patch* to stamp `velero.io/backup-name`/`restore-name` tracking labels onto the same object (`pkg/restore/restore.go` — "attempting patch on X" / "backup/restore label patch attempt failed" log lines). Whatever hits that second patch determines the failure shape:
+       - **(a) `NotFound` race — ManagedClusterAddOn deleted by addon-management-controller during cluster join (ACM-42666, confirmed via full timeline on both hubs):** For addons whose `ClusterManagementAddOn` uses a `Placement`-driven `installStrategy` with **no toleration for the `cluster.open-cluster-management.io/unreachable` taint** (e.g. `fleet-navigation`), there's an ~8-second window right after a `ManagedCluster` is restored where it hasn't finished its join handshake yet. During that window the addon-management-controller doesn't yet see the cluster as Placement-selected and deletes the just-restored `ManagedClusterAddOn`. If Velero's relabel-patch lands in that same instant, it gets `NotFound`. The moment the cluster reaches `Available: True` (confirmed same-second in the logs), the Placement re-selects it and the addon-management-controller **recreates the ManagedClusterAddOn on its own** — fully self-healing, no data loss, no manual fix needed. This is the [ocm#1346](https://github.com/open-cluster-management-io/ocm/issues/1346) `PlacementDecision`-churn pattern.
+       - **(b) Deterministic admission-webhook denial — search `CollectorConfig` (ACM-42665, different failure shape — do NOT assume it's the same as (a)):** search-v2-operator's `vcollectorconfig.kb.io` validating webhook unconditionally rejects **any** direct modification (not just Velero's) to its managed `CollectorConfig` objects ("X is managed by the search operator and cannot be modified directly") — this happens **every single restore, deterministically**, not a race. These `CollectorConfig` objects (per-integration configs like `app-lifecycle-integration`, `argo-integration`, `grc-integration`, plus `merged-collector-config`, all in the `ocm` namespace) are not user data — they're auto-generated by search-v2-operator based on which integrations are installed on the hub itself, and already exist correctly on the restore hub before the restore even runs. The failed patch is harmless (webhook blocks it, correct pre-existing object is untouched), but it's not really a race — the fix should be to **exclude `collectorconfigs.search.open-cluster-management.io` from the backed-up/restored resource set** in cluster-backup-operator, since it's a derived, operator-owned, webhook-protected resource with precedent for exclusion.
+       - **IMPORTANT — don't confuse (b) with the unrelated search-v2-operator NetworkPolicy/hostNetwork webhook-connectivity bug** (fixed via search-v2-operator PRs [#781](https://github.com/stolostron/search-v2-operator/pull/781)/[#860](https://github.com/stolostron/search-v2-operator/pull/860)/[#861](https://github.com/stolostron/search-v2-operator/pull/861)): on OVN-Kubernetes clusters where the kube-apiserver pods run with `hostNetwork: true`, an overly-restrictive `search-operator-network-policy` (`namespaceSelector: {}, podSelector: {}` under `from` on port 9443) can make the apiserver→webhook-pod call itself fail, producing `Internal error ... failed calling webhook "vcollectorconfig.kb.io": failed to call webhook: ... context deadline exceeded`. This is a **completely different, distinguishable error string** from the ownership-protection denial (`admission webhook "vcollectorconfig.kb.io" denied the request: X is managed by the search operator and cannot be modified directly`). Verified live on ACM-42665's two hubs (Aug 25 2026): the backup hub already had the NetworkPolicy fix (100% reliable, zero timeouts) yet still denied the patch 5/5 times with the ownership message; the restore hub still had the old NetworkPolicy (intermittent timeouts, ~2/3 tries) confirming that bug is real but separate. **Rule of thumb:** `context deadline exceeded` / `failed calling webhook` = the connectivity bug (search-v2-operator NetworkPolicy); `denied the request: ... cannot be modified directly` = the ownership-protection gap (no exemption for the backup/restore SA) — check the exact error text before assuming either one, and don't assume QE is just missing a fix without reproducing on both hubs.
+     - **Lesson:** don't assume two `PartiallyFailed`/"patch attempt failed" tickets from the same restore run share a root cause just because the log line shape looks similar at a glance ("patch attempt failed for X: <reason>") — always read the actual `<reason>` (`NotFound` vs. `admission webhook ... denied`) before generalizing.
 
 ### 5. "Managed clusters not reconnecting after restore"
 **Category:** Expected behavior / configuration
@@ -551,6 +617,60 @@ See the [OADP Version Compatibility](#oadp-version-compatibility) table above.
 
 **NOT officially tested by QE.** Advise customers to test on non-critical clusters first.
 
+### 10c. "Old hub's Hive controller keeps reconciling (overwrites certs, etc.) after a migrated cluster is detached" (ACM-43200)
+**Reporter:** Anne Faulhaber, Sep 2026 — direct follow-on from the same incremental Hive-cluster-migration
+work as ACM-38831/38832 (issue #15b). **Category:** Not a `cluster-backup-operator` bug — gap in the
+ACM "detach" workflow + a known Hive bug, but directly relevant to anyone following our "move one
+cluster at a time" guidance (#10b) above.
+
+**Symptom:** After migrating a Hive-provisioned cluster to a new hub and detaching it from the old
+hub, the *old* hub's Hive controller keeps reconciling the cluster's `ClusterDeployment` and its
+`SyncSet`s. Concretely: certificate secrets changed on the new hub get silently reverted back to the
+old values by a `SyncSet` still being pushed from the old hub.
+
+**Root cause (per Hive team, in Slack with Anne Faulhaber, Sep 2026):**
+- Detaching a cluster from ACM does **not** delete the `SyncSet` objects on the hub, and does not
+  clean up `SyncSet`-managed resources on the spoke — detach only stops ACM's own sync/management,
+  it does nothing to Hive's independent reconciliation loop.
+- If the old hub's Hive controller is still running, it keeps reconciling those `SyncSet`s against
+  the cluster regardless of the ACM "Detached" status. This is a known upstream Hive bug:
+  **ACM-1919** (Hive continues reconciling even after a cluster is set to "Detached").
+- **The real, root-cause rule (same one underlying issue #23 above):** if both hubs remain active for
+  the same cluster — even briefly, even if one side no longer shows it as attached in ACM's UI — they
+  compete to manage it. The old hub must be paused or shut down for that cluster at/immediately after
+  migration, not left running indefinitely.
+- Eric Fried (Hive): ACM's detach procedure *should* pause (or delete with `preserveOnDelete: true`)
+  the `ClusterDeployment` as part of detaching. Whether that's missing is an ACM detach-workflow gap
+  (not `cluster-backup-operator` — no detach or `SyncSet` code exists in this repo at all), separate
+  from the ACM-1919 Hive bug itself.
+
+**Immediate/manual workarounds (useful today, regardless of who fixes the upstream gaps):**
+- Annotate each migrated cluster's `ClusterDeployment` **on the old hub** with:
+  ```yaml
+  hive.openshift.io/syncset-pause: "true"
+  ```
+  This halts `SyncSet` reconciliation for that `ClusterDeployment` without deleting anything — do
+  this as an explicit step right after detaching a cluster during incremental migration (#10b).
+- Hive's **`ClusterRelocate`** CRD is purpose-built for hub-to-hub migration: it copies
+  `ClusterDeployment`, `SyncSet`s, `Secret`s, `MachinePool`s, etc. in the correct order, and
+  automatically adds a `hive.openshift.io/relocate` annotation on the source hub that pauses its
+  Hive controllers for that cluster — avoiding this class of conflict by construction. **Caveat from
+  the Hive team:** low usage and light recent maintenance; treat as a possible alternative to our
+  documented migration procedure, but advise testing carefully before relying on it, and it is not
+  something `cluster-backup-operator` integrates with today.
+
+**Documentation gap acknowledged by the Hive team directly:** our backup/restore migration guidance
+(#10b) doesn't mention `SyncSet` cleanup risk or reference `ClusterRelocate` as an alternative. Add
+the `syncset-pause` step to any incremental-migration runbook/customer guidance until the detach
+workflow itself is fixed.
+
+**Don't confuse this with the `ImportOnly` strategy** ([above](#importonly-strategy-acm-214-mce-29)) —
+`ImportOnly` is our existing, already-documented answer to "two hubs compete for the same cluster,"
+but it only governs the *import-controller*'s klusterlet re-sync behavior. It does **not** stop
+Hive's `SyncSet` reconciliation, which is exactly what caused this bug. Both need to be in place for
+Hive-provisioned clusters: `ImportOnly` on the old hub (registration layer) **and**
+`hive.openshift.io/syncset-pause: "true"` on the migrated `ClusterDeployment`s (Hive layer).
+
 ### 11. "Primary hub still running, want to move clusters to new hub"
 **Category:** Informational / procedure
 **Steps:**
@@ -559,6 +679,7 @@ See the [OADP Version Compatibility](#oadp-version-compatibility) table above.
   3. On new hub: create Restore to move managed clusters
   4. Cleanup on primary is optional
 **ACM 2.14+:** `ImportOnly` strategy eliminates the need for the prepare step in uncontrolled scenarios. See [ImportOnly Strategy](#importonly-strategy-acm-214--mce-29) section.
+**If the primary must stay running throughout** (e.g. a DR simulation rather than a real handover), use `disable-auto-import` on the primary's `ManagedCluster` resources instead — see [DR Simulation with `disable-auto-import`](#dr-simulation-with-disable-auto-import-keep-the-original-hub-running).
 **Blog:** https://developers.redhat.com/learn/openshift/move-managed-clusters-using-acm-212-backup-component
 
 ### 12. "Application data backup on managed clusters"
@@ -925,6 +1046,172 @@ own CRDs and mechanics, not just "a backup tool that happens to be OADP":
   controller entirely and isn't a documented or tested procedure.
 **No official written "not supported" statement exists for this specific question** (Kasten wasn't
 named in any doc found) — the confidence here comes from the architecture, not a citation.
+
+### 23. "Can two hubs be mutually active AND passive of each other at the same time?"
+**Reporter:** Caleb Donald (customer-facing Slack), Aug 2026. **Answer by:** Valentina Birsan.
+**Category:** Not supported — architectural, not a config gap.
+
+**Scenario:** Two OpenShift clusters, both configured as ACM hubs, each managing a separate group
+of managed clusters, sharing one S3 bucket. Cluster 1 is "active", Cluster 2 is "passive". Customer
+wants to know if each can *also* be a backup target for the other simultaneously — i.e., both
+active and passive at once, presumably using separate S3 prefixes per cluster to avoid storage
+collisions.
+
+**Answer: no, not supported.** The documented restore precondition is that the restore hub must
+have *no other resources* (including no other managed clusters) besides what the restore itself
+creates. A hub that's independently active with its own real managed clusters fails that
+precondition. Reasons this matters, not just a documentation technicality:
+- **DR requires recovering into an identical, clean copy of the source hub.** If the restore hub
+  already has unrelated live content, "restore the hub in an identical format" is impossible by
+  definition — you'd end up with a merged/polluted state, not a recovery of hub 1.
+- **Restore cleanup would fight the hub's own independent state.** Each restore run cleans up
+  resources tagged from a *previous restore* that are no longer in the latest backup (see
+  `cleanupBeforeRestore: CleanupRestored`, [Cleanup Options](#cleanup-options-cleanupbeforerestore)
+  above) — this is what lets a passive hub receiving incremental restores stay in sync when
+  something is deleted on the source. If the "passive" side also has its own real, independently
+  managed clusters, this cleanup logic has no way to distinguish "stale restored resource, safe to
+  delete" from "this hub's own live resource, do not touch."
+- **Placement/policy collision risk.** If unrelated apps or policies already exist on a hub that
+  then receives someone else's restored data, `Placement` matches could cause those to roll out
+  onto the *other* hub's managed clusters unintentionally — a correctness/safety issue, not just an
+  inconvenience.
+- Splitting by S3 **prefix** doesn't fix any of the above — separate prefixes only solve the
+  storage-collision problem (two active hubs' backups colliding in one bucket); they do nothing
+  about the restore-target-must-be-clean precondition.
+- **Confirmed independently by the Hive team** (see [issue #10c](#10c-old-hubs-hive-controller-keeps-reconciling-overwrites-certs-etc-after-a-migrated-cluster-is-detached-acm-43200)
+  below): even a *temporary* window where both hubs are active for the same Hive-managed cluster is
+  enough to cause real damage (old hub's `SyncSet`s silently reverting cert changes made on the new
+  hub) — this isn't a theoretical restore-hygiene rule, it's been observed in production.
+
+**What to point customers to instead:** Multicluster Global Hub HA support and cluster migration —
+this is the closest supported path for what the customer is actually trying to accomplish (mutual
+resilience between two hub "roles"), without violating the active/passive architecture:
+<https://docs.redhat.com/en/documentation/red_hat_advanced_cluster_management_for_kubernetes/2.17/html/multicluster_global_hub/multicluster-global-hub#global-hub-migrate-process>
+
+### 24. "Delete+recreate of a backed-up resource (same name, new spec) is never fixed by passive-sync delta-cleanup — ClusterInstance IP change case" (ACM-47091)
+**Category:** Confirmed cluster-backup-operator gap (delta-cleanup blind spot), Sev1, ROOT CAUSE
+FOUND AND CONFIRMED, fix implemented locally (not yet PR'd/merged as of 2026-09-29). **Reporter:**
+ZTP customer via Fdewaley/mshalan/nahian,
+Sept 2026. **Independently verified** via a second, fully independent code-reading pass (opus,
+2026-09-28) against both `cluster-backup-operator` and Velero v1.18.2 source — no corrections
+needed to the mechanism below. **Confirmed by customer (mshalan, 2026-09-28):** the DR hub's
+passive-sync `Restore` used `cleanupBeforeRestore: CleanupRestored` (not `None`) — this rules out
+the simpler "cleanup never ran" explanation and locks in the compound blind-spot theory below as
+the actual root cause, not just a plausible one.
+
+**Symptom:** Customer changed 28 worker node IPs on a ZTP-deployed cluster. On the active hub, they
+deleted the `ClusterInstance` and recreated it (same name, new `.spec.nodes[].nodeNetwork...ip`
+values), triggering a real reinstall. The nightly backup only ever saw the *new* `ClusterInstance`
+— it never captured a moment where the object was absent. On the DR (passive) hub, the *old*
+`ClusterInstance` (old IPs) was still present from a prior restore cycle. Velero's restore tried to
+`Patch` it to the new IPs; SiteConfig's admission webhook correctly rejected the spec change
+(`"spec update not allowed during provisioning or cluster reinstalls"`). The ACM `Restore` still
+reported `Completed` (not `PartiallyFailed`) and nobody noticed until the actual failover, when the
+DR hub came up still pointing at the stale (old) node IPs.
+
+**The support-engineer-level sequence (correct, from the Slack thread) is:**
+delete+recreate on active hub → backup skips the "absent" window entirely → stale object survives
+on DR hub → Velero patch rejected by SiteConfig → silently stuck forever, restore still shows
+`Completed`.
+
+**The deeper root cause (confirmed by reading both `cluster-backup-operator` and Velero
+v1.18.2 source — this is the part not yet identified in the incident thread):**
+`cluster-backup-operator` already *has* a delta-cleanup safety net designed to catch exactly this
+class of staleness — `cleanupDeltaForResourcesBackup` → `deleteDynamicResourcesForBackup`
+(`controllers/restore_post.go:402-465`), gated on `cleanupBeforeRestore: CleanupRestored` (the
+documented value for continuous passive sync, README.md line 395/502). It decides what to delete
+purely via a **label comparison**:
+```go
+labelSelector := fmt.Sprintf("%s, %s notin (%s), %s",
+    BackupNameVeleroLabel, BackupNameVeleroLabel, backupName, genericLabel)
+```
+i.e. "delete anything whose `velero.io/backup-name` label doesn't match the current backup name."
+
+The blind spot: when Velero's `processUpdateResourcePolicy`
+(`vendor/vmware-tanzu/velero/pkg/restore/restore.go:2486`, v1.18.2) hits the stale `ClusterInstance`
+and its full `Patch` (new spec) fails due to the SiteConfig webhook rejection, it **falls back** to
+`updateBackupRestoreLabels` (line 2511) — a *separate*, labels-only patch that does NOT touch
+`.spec`. Since SiteConfig's webhook only validates spec changes, this fallback patch **succeeds**.
+Net effect: the stale object's `velero.io/backup-name` label gets refreshed to point at the
+*current* backup every single restore cycle, even though its `.spec` content is permanently frozen
+at the old value. From then on, `cleanupDeltaForResourcesBackup`'s label-selector sees this object
+as "belonging to the current backup" and **never** flags it for deletion — the one mechanism that
+could otherwise have self-healed this on the very next sync cycle is permanently defeated. This also
+explains why `Restore` phase stayed `Completed`: Velero only downgrades to `PartiallyFailed` on hard
+`Errors`; a rejected spec-patch-with-successful-label-fallback is recorded as a `Warning` only,
+buried under the per-namespace section of `velero restore describe`, not surfaced as a failure.
+
+**Not a SiteConfig bug** — its webhook did exactly what it should (protect a resource mid-provision/
+reinstall from concurrent spec edits). **Also, on reflection, not really a Velero bug either** — see
+the upstream-maintainer feedback below. **The actual gap is in `cluster-backup-operator`'s own
+assumption**: delta-cleanup's "is this current" check treats `velero.io/backup-name` matching the
+current backup as proof the object's *content* is in sync — a guarantee that label was never
+designed to provide.
+
+**Velero upstream feedback (sseago + Shubham, `#oadp-dev`, 2026-09-29) — corrects our framing:**
+we raised the labels-only-fallback behavior with the Velero/OADP team expecting it might be an
+oversight worth fixing upstream. Their response: **it's deliberate, by original design.**
+`velero.io/backup-name`/`restore-name` are "delta identification" labels — their intended meaning is
+*"this object was targeted by restore X from backup Y"* (provenance/tracking, used by other
+label-based tooling), **not** *"this object's content currently matches backup Y."* We were relying
+on a guarantee the label was never meant to provide. sseago also noted that changing this behavior
+would need to be a new opt-in server flag (to avoid breaking other consumers relying on today's
+semantics for their own tooling), and even flagged upstream maintainers might reject it. **Practical
+conclusion: don't expect/wait on an upstream fix — the operator-side fix below is the correct and
+likely only practical path.**
+
+**Fix implemented (as of 2026-09-29, on a local branch, not yet merged/PR'd):**
+Added `warningSensitiveKinds`, a small explicit package-level allowlist of resource Kinds known to
+have this failure pattern (currently just `ClusterInstance`). When a Velero `Restore`'s
+`Status.Warnings > 0`, delta-cleanup now *additionally* deletes resources of an allowlisted Kind
+even if their `velero.io/backup-name` label matches the current backup — forcing a clean `Create` on
+the next sync cycle instead of a `Patch` (relies on the — plausible but not yet live-cluster-verified
+— assumption that the guarding webhook only blocks `UPDATE`, not `CREATE`). **Deliberately scoped to
+an explicit allowlist, not applied hub-wide**, to avoid unnecessarily deleting/recreating every
+resource in a backup type just because one unrelated item produced a warning elsewhere. Easily
+extended (e.g. to search's `CollectorConfig` webhook, ACM-42665/42666) by adding one more map entry.
+
+**Rejected/infeasible alternatives (investigated and ruled out):**
+- *Read Velero's per-item restore result detail* (`persistence.BackupStore.GetRestoreResults()`
+  technically exists in Velero's Go API and returns exactly this) — **technically possible but
+  impractical**: constructing a real `BackupStore` requires Velero's full plugin-manager/
+  object-store-provider-loading machinery (`ObjectStoreGetter.GetObjectStore(provider)`), the same
+  RPC plugin framework the Velero *server* itself uses to talk to AWS/GCP/Azure. Bolting that onto
+  `cluster-backup-operator` just for this would be a far bigger, riskier change than warranted.
+- *Compare backed-up spec content vs. live spec content directly* — same object-storage-access
+  problem as above; the backed-up object's content lives in the backup tarball in object storage,
+  not accessible via any K8s API `cluster-backup-operator` already has.
+- *Switch `ExistingResourcePolicy` to `none` instead of `update`* — would avoid the labels-only
+  fallback, but also means **nothing ever gets updated on any subsequent sync cycle, for any
+  resource** — breaks continuous passive sync's entire purpose. Not viable as a global setting, and
+  Velero's `RestoreSpec.ExistingResourcePolicy` is a single restore-wide value with no per-resource-
+  kind override.
+
+**Recovery path debated in the incident (unresolved as of writeup):** failing back to the original
+hub using a known-good pre-failover backup was proposed (`mshalan`) but flagged as risky
+(`Fdewaley`, and separately QE's Thuy Nguyen: "I don't think falling back to the original hub could
+fix the problem, given that the backups are not good") since it's unclear how much of the current
+DR-hub backups can be trusted more broadly, not just for this one `ClusterInstance`. **QE-proposed
+alternative (Thuy Nguyen):** temporarily disable/bypass the SiteConfig admission webhook on the DR
+hub just long enough for one normal passive-sync restore cycle to complete — this directly removes
+the specific obstacle blocking Velero's `Patch`, letting the next sync correctly update the stale
+`ClusterInstance` to the real (already-reinstalled) `181.x` values without needing any failback.
+Since the physical cluster was already successfully reinstalled with the new IPs on the original
+hub before failover, this patch on the DR hub should only be reconciling stale *metadata* to match
+physical reality, not triggering a disruptive live reconfiguration — but this should be confirmed
+with the SiteConfig team before relying on it, and the webhook should be re-enabled immediately
+after the one cycle completes to avoid leaving other in-flight provisions/reinstalls unprotected
+during the window. No definitive guidance existed for "how to recover from a hub stuck with a
+stale ClusterInstance post-failover" — worth adding to official DR docs once a recommended
+procedure is settled.
+
+**Related:** [issue #21](#21-baremetalhost-stuck-in-inspecting-after-dr--clusterinstance-restored-when-it-shouldnt-be-acm-39330)
+(ACM-39330) — same `ClusterInstance`/SiteConfig restore-interaction theme, but a different failure
+mode (Day-1 re-render vs. this delta-cleanup blind spot). Also structurally similar to ACM-42665
+(search's `CollectorConfig` ownership webhook) and ACM-42666 (`fleet-navigation` addon) — the
+recurring pattern across all three: a component-owned admission webhook denies Velero's restore
+`Patch`, and the failure is either silently swallowed or not visible enough to catch before it
+matters.
 
 ## Backport Branch Selection Policy — which release branches to target
 When a fix needs backporting beyond the branch it merged to, don't backport to every existing

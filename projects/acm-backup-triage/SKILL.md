@@ -83,6 +83,7 @@ Each maps to a section in [KNOWLEDGE_BASE.md](KNOWLEDGE_BASE.md):
 | 9 | OADP version compatibility |
 | 10 | Moving managed clusters between non-identical hubs |
 | 10b | Incremental/repeated single-cluster migration |
+| 10c | Old hub's Hive controller reconciles/overwrites certs after detach (ACM-43200, ACM-1919) — use `hive.openshift.io/syncset-pause`, consider `ClusterRelocate` |
 | 11 | Primary hub still running, want to move clusters |
 | 12 | Application data backup on managed clusters (out of scope) |
 | 13 | Restore webhook rejection (sync mode rules) |
@@ -96,6 +97,8 @@ Each maps to a section in [KNOWLEDGE_BASE.md](KNOWLEDGE_BASE.md):
 | 20 | DR at scale (70-137+ clusters) |
 | 21 | BareMetalHost stuck Inspecting after DR (ACM-39330) |
 | 22 | Third-party backup tools (e.g. Kasten) — NOT supported |
+| 23 | Mutual active+passive between two hubs simultaneously — NOT supported (Global Hub HA/migration instead) |
+| 24 | ClusterInstance delete+recreate defeats passive-sync delta-cleanup (ACM-47091, Sev1) — Velero's labels-only fallback masks stale spec |
 
 ## Process references
 
