@@ -99,10 +99,12 @@ Each maps to a section in [KNOWLEDGE_BASE.md](KNOWLEDGE_BASE.md):
 | 22 | Third-party backup tools (e.g. Kasten) — NOT supported |
 | 23 | Mutual active+passive between two hubs simultaneously — NOT supported (Global Hub HA/migration instead) |
 | 24 | ClusterInstance delete+recreate defeats passive-sync delta-cleanup (ACM-47091, Sev1) — Velero's labels-only fallback masks stale spec |
+| 25 | Generic-resources restore silently skipped on pinned backup names — sibling-matching drift (ACM-49571, fixed PR #1798) |
 
 ## Process references
 
 - [Security Fix Verification](KNOWLEDGE_BASE.md#security-fix-verification-methodology)
+- [Live Cluster Validation Methodology](KNOWLEDGE_BASE.md#live-cluster-validation-methodology--testing-cluster-backup-operator-changes-on-a-real-hub-before-backport)
 - [CVE Fix Workflow](KNOWLEDGE_BASE.md#standard-cve-fix-workflow-business-continuity--sustaining-admins)
 - [Backport Branch Selection](KNOWLEDGE_BASE.md#backport-branch-selection-policy-which-release-branches-to-target)
 - [CI / Prow Notes](KNOWLEDGE_BASE.md#ci--prow-infrastructure-notes-openshiftrelease)

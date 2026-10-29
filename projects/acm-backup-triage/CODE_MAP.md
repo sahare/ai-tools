@@ -170,7 +170,13 @@ collisionControlInterval = 5 minutes
 - `setOptionalProperties()` (line ~842) — sets Velero restore properties (ExcludedResources,
   ExistingResourcePolicy, hooks, filters, namespace mapping)
 - `setUserRestoreFilters()` (line ~884) — applies user-provided label/resource filters
-- `getVeleroBackupName()` (line ~585) — resolves "latest"/"skip"/specific backup name
+- `getVeleroBackupName()` (line ~639) — resolves "latest"/"skip"/specific backup name; for
+  specific names, matches a pinned `resources`/`credentials` backup to its `resources-generic`
+  sibling using the name-embedded timestamp (`getBackupTimestamp()` in `utils.go`, line ~140) with
+  a `siblingBackupNameWindow` (5 min, line ~634) fallback + nearest-candidate sort — see
+  [ACM-49571 writeup](KNOWLEDGE_BASE.md#25-generic-resources-backuprestore-silently-skipped-on-pinned-non-latest-backup-names--sibling-backup-matching-drift-acm-49571)
+  for the full history (do not match on `Status.StartTimestamp` or `ObjectMeta.CreationTimestamp` —
+  both were tried and superseded, for reasons documented there)
 - `isValidSyncOptions()` (line ~105) — validates sync mode configuration
 - `isValidCleanupOption()` in `restore_post.go` (line ~741) — validates CleanupAll annotation
 

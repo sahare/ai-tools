@@ -1213,6 +1213,69 @@ recurring pattern across all three: a component-owned admission webhook denies V
 `Patch`, and the failure is either silently swallowed or not visible enough to catch before it
 matters.
 
+### 25. "Generic-resources backup/restore silently skipped on pinned (non-`latest`) backup names — sibling-backup matching drift" (ACM-49571)
+**Category:** Confirmed bug, fixed. **Fix:** [PR #1798](https://github.com/stolostron/cluster-backup-operator/pull/1798)
+("use name-embedded timestamp instead of StartTimestamp to match generic-resources backups"),
+targeting `main`, validated live Oct 29 2026 (see
+[Live Cluster Validation Methodology](#live-cluster-validation-methodology--testing-cluster-backup-operator-changes-on-a-real-hub-before-backport)
+below). Not yet backported to any release branch as of this writing — check PR/backport-PR state
+before assuming a specific branch has it.
+
+**Symptom:** A `Restore` that pins exact (non-`latest`) names for `veleroResourcesBackupName` /
+`veleroCredentialsBackupName` sometimes never restores the companion `resources-generic` backup's
+content (anything cluster-wide carrying the `cluster.open-cluster-management.io/backup` label,
+discovered via Velero's wildcard `IncludeClusterResources=true` scan) — while `ManagedCluster`/
+activation-data restoration (a separate, non-generic path) completes normally for the same request.
+Net effect: partial, silent data loss on restore that's easy to miss because nothing fails loudly.
+
+**Root cause:** the original matching logic paired a pinned `resources` backup to its
+`resources-generic` sibling by comparing `Backup.Status.StartTimestamp` (when Velero's backup
+*controller* actually began executing each one — queue/load-dependent) within a 30-second window.
+Velero's `schedule_controller.go` reconciles the operator's 5 sibling `Schedule` objects
+(acm-resources, acm-resources-generic, acm-credentials, acm-managed-clusters,
+acm-validation-policy) **completely independently** — there is no cross-schedule coordination, so
+under load the generic-resources backup's actual execution can lag its sibling's by well over 30
+seconds even though both were scheduled for the identical cron tick. Confirmed directly against
+vendored Velero v1.18.2 source (`submitBackup()`'s per-reconcile `now := c.clock.Now()`).
+
+**Fix evolution — two superseded approaches, useful as a case study:**
+- **Rejected approach ("Fix A", surface the mismatch as a hard error instead of silently skipping):**
+  blocked in team-lead review — a hard error on the generic-resources side while activation/
+  `ManagedCluster` restoration for the *same request* keeps completing normally is inconsistent and
+  more alarming without fixing the actual miss. ([PR #1797](https://github.com/stolostron/cluster-backup-operator/pull/1797),
+  closed.)
+- **Superseded approach (match on `Backup.ObjectMeta.CreationTimestamp` instead of `StartTimestamp`):**
+  looked correct in isolation, but `CreationTimestamp` is reset to the sync time whenever OADP's
+  backup-sync controller re-creates a local `Backup` CR for content discovered in object storage
+  without a matching local record — **exactly what happens during DR failover onto a passive/new
+  hub, i.e. this operator's primary use case.** Multiple originally-hours-apart backups can get
+  bulk-resynced in the same pass and end up with identical `CreationTimestamp`s, destroying the
+  signal entirely. Proven live, not just by inspection — see test **N2** in the Live Cluster
+  Validation Methodology section below for the exact reproduction (two sibling backups resynced to
+  the *identical* `CreationTimestamp`, ~10 minutes apart from their real execution time).
+- **Final fix:** match using the timestamp **embedded in the backup's name itself**
+  (`getBackupTimestamp()` in `controllers/utils.go`, parsing the suffix Velero's own
+  `item.TimestampedName()` assigns once, at creation) — the only signal that survives both
+  schedule-controller execution drift and backup-sync re-creation, because it's baked into the
+  name at creation time rather than re-derived from any execution- or sync-time field.
+- Three further CodeRabbit-driven refinements landed on top of the name-timestamp fix itself
+  (all in the same PR #1798, all independently verified live — see N1/N3/N4 below):
+  1. exclude match candidates not in a restorable phase (`Completed`/`PartiallyFailed`) — an
+     `InProgress` sibling must never be selected.
+  2. widen the fallback search window from 30s to 5 minutes (`siblingBackupNameWindow` constant,
+     `controllers/restore.go`) — same sibling-reconcile-delay root cause, now measured against the
+     reliable name-embedded timestamp instead of execution time.
+  3. when multiple candidates fall within that window (e.g. a `veleroSchedule` cron shorter than
+     the window), sort by absolute time distance and pick the nearest — don't rely on Kubernetes'
+     unspecified `List()` ordering.
+
+**Customer messaging — "why would a customer pin exact backup names instead of `latest`?"** came up
+directly while triaging a real case. `latest` is the recommended pattern specifically because it
+sidesteps this entire class of problem; if a customer is found pinning exact names, the right move
+is to ask them why (via the case rep) rather than assume it's required, while being clear the fix
+for the pinned-name path is in progress in parallel. Don't frame pinned names as unsupported — just
+not the default/recommended pattern.
+
 ## Backport Branch Selection Policy — which release branches to target
 When a fix needs backporting beyond the branch it merged to, don't backport to every existing
 release branch reflexively. Reasoning to apply:
@@ -1396,6 +1459,106 @@ note:**
 fix being "safe to ship without a heads-up" are two different bars. Always evaluate both before
 signing off on a security fix, and call out any silent-failure-mode fixes explicitly when handing
 off for release-note authoring.
+
+## Live Cluster Validation Methodology — Testing cluster-backup-operator Changes on a Real Hub Before Backport
+
+General, reusable procedure for validating a code change against a real hub + real OADP/Velero +
+real S3 (not just unit/envtest), developed while live-validating
+[PR #1798](https://github.com/stolostron/cluster-backup-operator/pull/1798) (issue #25 above) on
+`app-aws-east2-500-hub3-xr9r6` (Oct 29 2026, OCP 5.0.0-ec.3 / MCE 5.0 / ACM 5.0, hub shared with
+the `se-*` team naming convention).
+
+**Standing up the hub:**
+- `cluster-backup` is a `MultiClusterHub` (ACM/MCH) component, **not** a standalone
+  `MultiClusterEngine` (MCE) component, despite being colloquially described as "enable it on
+  MCE" — on this build MCE's own component list doesn't include it at all; it's
+  `spec.overrides.components[name=cluster-backup].enabled` on the `MultiClusterHub` CR. Enabling it
+  auto-installs OADP as a chart hook into `open-cluster-management-backup` (confirmed — matches
+  README.md's documented behavior).
+- If `MultiClusterHub` has `installer.open-cluster-management.io/pause: "true"` (common on dev/test
+  hubs left in a partially-configured state), set it to `"false"` first or component toggles never
+  take effect. **If you then hand-edit any resource MCH manages (e.g. swapping a Deployment's image
+  for a test build), re-pause it immediately after** — MCH's own reconcile loop reverts manual edits
+  back to its chart-rendered desired state on its next pass otherwise. No `OPERAND_IMAGE_*`-style
+  override env var was found for `cluster-backup` specifically (several MCE components do have one,
+  e.g. `OPERAND_IMAGE_BACKPLANE_OPERATOR`) — direct Deployment image patch + re-pause is the only
+  method found for swapping in a test image.
+- The `cluster-backup-chart` Deployment's container is named `cluster-backup` — not `manager`, not
+  `cluster-backup-chart-clusterbackup` (that's the Deployment's own name; easy to confuse,
+  independently flagged in this repo's `AGENTS.md` "Common Pitfalls" too).
+
+**Building a test image without a local container runtime:**
+- If local podman/docker isn't running, an in-cluster `BuildConfig` with `--binary=true` +
+  `oc start-build --from-dir=<local-dir>` pushes a locally-patched Dockerfile (e.g. swapping a
+  CI-only base image like `registry.ci.openshift.org/stolostron/builder:go1.26-linux` for a public
+  one like `docker.io/library/golang:1.26` if the cluster can't pull the CI-only one) **without
+  touching the git branch at all** — binary builds upload a tarball of whatever local directory you
+  point at, bypassing git entirely. Good for throwaway test builds that must never become a real
+  commit.
+- **Gotcha:** the `cluster-backup` chart installs a `deny-all` NetworkPolicy in
+  `open-cluster-management-backup` (plus narrow allows for apiserver/DNS/OADP-metrics/
+  velero-storage/webhook-ingress) — an in-cluster build running *in that namespace* cannot reach
+  even the internal image registry to push its own output. **Run test builds in a separate,
+  unrestricted namespace**; if the consuming namespace needs to pull the result, grant
+  `system:image-puller` to `system:serviceaccounts:<consuming-namespace>` scoped to the build
+  namespace, rather than loosening the backup namespace's own NetworkPolicy.
+- If local `docker`/`podman` + registry credentials already work (e.g. quay.io login already set up,
+  `credsStore` configured in `~/.docker/config.json`), build and push locally with the real,
+  unmodified Dockerfile instead — simpler, and avoids both issues above. Only reach for the
+  in-cluster binary-build workaround when local container tooling genuinely isn't available.
+
+**S3 / `DataProtectionApplication` setup:**
+- `cloud-credentials` Secret format for this chart: a single key named `cloud`, containing AWS
+  CLI-style INI content (`[default]\naws_access_key_id=...\naws_secret_access_key=...`) — the
+  OADP/velero-plugin-for-aws convention, documented in README.md but easy to get wrong by assuming
+  separate `aws_access_key_id`/`aws_secret_access_key` keys (which *is* the shape used by several
+  unrelated in-cluster credential secrets, e.g. `openshift-machine-api/aws-cloud-credentials` —
+  don't copy that shape here).
+- You can determine an S3 bucket's region with zero AWS credentials via
+  `curl -sI https://<bucket>.s3.amazonaws.com` — AWS returns the `x-amz-bucket-region` header even
+  on the resulting 403.
+- **If testing against a bucket shared with other engineers/teams, set `objectStorage.prefix` on the
+  `DataProtectionApplication`'s backup location to an isolated, clearly-named test prefix** — makes
+  full cleanup trivial (`aws s3 rm s3://<bucket>/<prefix>/ --recursive`) without touching anyone
+  else's data and avoids any risk of colliding Backup names.
+- `Backup.velero.io` CRs carry **no finalizer** in this setup — a plain `kubectl delete backup
+  <name>` removes only the local Kubernetes record and leaves the S3 data untouched (the cascading
+  S3 delete only happens via Velero's `DeleteBackupRequest` flow). Deliberately useful for
+  simulating backup-sync recreation: delete the local CR, wait for OADP's `backupSyncPeriod`
+  (observed ~45-60s with no explicit override set) to recreate it from S3 with a fresh
+  `CreationTimestamp` — this is exactly how issue #25's test N2 was reproduced without needing a
+  second physical hub. Also means routine ad hoc cleanup needs an explicit S3-level delete;
+  `kubectl delete` alone won't free any storage.
+
+**Restore/Schedule test-design gotchas:**
+- A non-paused `BackupSchedule` and an active `Restore` are mutually exclusive in the same
+  namespace by design (see issue #13 / CRITICAL RULES) — `oc patch backupschedule <name>
+  --type=merge -p '{"spec":{"paused":true}}'` before creating any test `Restore`, and only unpause
+  when you need more backup cycles. A `Restore` left in `Error` phase still counts as "active" and
+  blocks a second one — delete it explicitly, don't assume a non-`Finished` phase is a no-op.
+- `cleanupBeforeRestore: CleanupAll` requires an explicit
+  `cluster.open-cluster-management.io/restore-cleanup-all-confirmed: "true"` annotation on the
+  `Restore` resource — without it, the request is rejected with `FinishedWithErrors` rather than
+  performing the mass deletion. A real safety net; don't add that annotation in a throwaway test
+  against a shared cluster unless you actually mean it.
+- Velero restores on OpenShift routinely show `FinishedWithErrors`/`PartiallyFailed` purely from
+  `Project.project.openshift.io` immutable-field patch attempts (Velero tries to stamp
+  `velero.io/backup-name`/`restore-name` tracking labels onto already-existing Projects/Namespaces
+  post-restore, and OpenShift's `Project` resource rejects several of those fields as immutable) —
+  **check the actual `Restore.velero.io` object's warning/error content (or velero pod logs filtered
+  by restore name) before treating any non-`Completed` phase as a real functional failure.** This
+  specific noise is unrelated to any `cluster-backup-operator` logic and appears on any restore of
+  pre-existing namespaces, not just ones touched by a particular fix.
+- To exercise sibling-backup-matching logic end to end (not just via unit tests), a short
+  `veleroSchedule` cron (e.g. `*/3 * * * *`) during a live test run naturally produces real
+  adjacent-cycle conditions — no need to contrive timing separately. This is how issue #25's test
+  N4 (nearest-candidate selection) was validated: deleted one cycle's exact-match sibling, left two
+  real candidates at genuinely different distances, and confirmed the nearer one won.
+- Forcing a "sibling still `InProgress`/`Queued`" phase-filter case live is impractical at realistic
+  test-data scale — backups of a few hundred items complete in 2-4 seconds, too fast to race
+  reliably without injecting disruptive amounts of extra content onto a shared cluster. Treat this
+  specific case as unit-test-only coverage (this repo's suite has a dedicated fixture for it); don't
+  block a live-validation pass on reproducing it live.
 
 ## CI / Prow Infrastructure Notes (openshift/release)
 
